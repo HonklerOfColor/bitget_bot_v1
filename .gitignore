@@ -1,0 +1,16 @@
+# Secrets — never commit
+config.py
+scalper_config.py
+.env
+.env.*
+
+# Runtime / local data
+*.log
+spread_learnings.json
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+
+# Vendored dependencies (use requirements.txt)
+lib/
