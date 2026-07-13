@@ -1,19 +1,10 @@
 # DS-SpreadScalper
 
-High-frequency spread-scalping bot for **Bitget USDT-M Futures** (demo/live).
+Automatisierter Spread-Scalping-Bot für **Bitget USDT-M Futures** (Demo oder Live).
 
-Places post-only limit orders inside the bid-ask spread, sets ATR-based TP/SL on the exchange, and monitors positions in a 2-second loop across BTC, ETH, SOL, and XRP.
+Der Bot platziert Post-Only-Limit-Orders innerhalb des Bid/Ask-Spreads, setzt ATR-basierte Take-Profit- und Stop-Loss-Orders auf der Exchange und überwacht alle 2 Sekunden die Positionen in BTC, ETH, SOL und XRP.
 
-## Features
-
-- Post-only maker entries inside the spread
-- ATR-based TP/SL via Bitget `place-pos-tpsl`
-- PnL-protected SL move at +1% ROE
-- Trade logging and per-symbol stats (`spread_learnings.json`)
-- Telegram notifications (TP only)
-- Terminal dashboard for live position overview
-
-## Setup
+## Schnellstart
 
 ```bash
 git clone https://github.com/HonklerOfColor/bitget_bot.git
@@ -21,46 +12,30 @@ cd bitget_bot
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
-cp config.example.py config.py          # add Bitget API keys
-cp scalper_config.example.py scalper_config.py  # optional: Telegram
+cp config.example.py config.py
+cp scalper_config.example.py scalper_config.py   # optional, für Telegram
 ```
 
-Edit `config.py`:
-- Set `API_KEY`, `SECRET_KEY`, `PASSPHRASE`
-- Keep `DEMO_MODE = True` for Bitget demo account
-
-## Usage
+In `config.py` die Bitget-API-Keys eintragen. Für Demo-Trading `DEMO_MODE = True` lassen.
 
 ```bash
-# Start the bot
-python3 spread_scalper.py
-
-# Live dashboard (separate terminal)
-python3 dashboard.py
+python3 spread_scalper.py      # Bot starten
+python3 dashboard.py           # Live-Übersicht (separates Terminal)
 ```
 
-## Project Structure
+## Dateien
 
-| File | Description |
-|------|-------------|
-| `spread_scalper.py` | Main trading bot |
-| `bitget_client.py` | Bitget Futures API wrapper |
-| `dashboard.py` | Terminal UI for open positions |
-| `telegram_notify.py` | Telegram alerts |
-| `STRATEGY.md` | Strategy documentation |
-| `TRADING_RULES.md` | Trading rules |
-| `backtest/` | Historical 1H candle data |
+| Datei | Beschreibung |
+|-------|--------------|
+| `spread_scalper.py` | Hauptbot |
+| `bitget_client.py` | Bitget-API-Wrapper |
+| `dashboard.py` | Terminal-Dashboard |
+| `telegram_notify.py` | Telegram-Benachrichtigungen |
+| `STRATEGY.md` | Strategie im Detail |
 
-## Strategy
+## Hinweise
 
-See [STRATEGY.md](STRATEGY.md) for entry logic, TP/SL rules, and risk management.
+- `config.py` und `scalper_config.py` enthalten Secrets und werden **nicht** ins Repo committed.
+- Ausführliche Strategie- und Risikoregeln: [STRATEGY.md](STRATEGY.md)
 
-## Security
-
-- **Never commit** `config.py` or `scalper_config.py` — they contain API keys
-- Use Bitget demo mode for testing (`DEMO_MODE = True`)
-- Rotate keys if they were ever exposed
-
-## Disclaimer
-
-For educational purposes. Trading futures involves substantial risk. Use at your own risk.
+**Disclaimer:** Nur zu Bildungszwecken. Futures-Trading ist mit erheblichem Risiko verbunden.

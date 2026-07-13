@@ -1,13 +1,21 @@
 #!/usr/bin/env python3
 """📊 DS-SpreadScalper Dashboard — Terminal-UI."""
-import sys, os, time
+import sys, os, time, json
 from datetime import datetime
 
-sys.path.insert(0, "/Users/andreas/bitget_bot")
+sys.path.insert(0, "/Users/andreas/bitget_bot_v1")
 import bitget_client as client
 
 REFRESH = 3
 LEVERAGE = 5
+STATE_PATH = "/Users/andreas/bitget_bot_v1/bot_state.json"
+
+def read_bot_state():
+    try:
+        with open(STATE_PATH) as f:
+            return json.load(f) or {}
+    except:
+        return {}
 
 def clr():
     os.system('clear 2>/dev/null || printf "\\033c"')
@@ -53,6 +61,7 @@ def main():
         if not positions:
             print(f"\n  \033[90mKeine offenen Positionen\033[0m\n")
         else:
+            bot_state = read_bot_state()
             for p in positions:
                 sym   = p.get('symbol', '?')
                 side  = p.get('holdSide', '?')
@@ -60,17 +69,19 @@ def main():
                 mark  = float(p.get('markPrice', 0))
                 size  = float(p.get('total', 0))
                 pnl   = float(p.get('unrealizedPL', 0))
-                sl    = p.get('stopLoss')
-                tp    = p.get('takeProfit')
+                # SL/TP vom Bot-State (trackt place-pos-tpsl), sonst Exchange-Fallback
+                bdata = bot_state.get(sym, {})
+                sl    = bdata.get('sl') or p.get('stopLoss')
+                tp    = bdata.get('tp') or p.get('takeProfit')
                 liq   = float(p.get('liquidationPrice', 0))
                 margin = size * mark / LEVERAGE
                 roe   = pnl / margin * 100 if margin > 0 else 0
                 
-                prot = (side=='long' and sl and float(sl) >= entry) or \
-                       (side=='short' and sl and float(sl) <= entry)
+                prot = (side=='long' and sl and float(sl) < mark) or \
+                       (side=='short' and sl and float(sl) > mark)
                 icon = "\033[32m🔒\033[0m" if prot else "\033[33m🔓\033[0m"
                 
-                safe_text = " \033[32m✅ Trade SL abgesichert!\033[0m" if prot else ""
+                safe_text = " \033[32m✅ Trade SL abgesichert!\033[0m" if prot and roe > 1 else ""
                 print(f"\n  \033[1m{sym:9s}\033[0m {side.upper():6s} {icon}{safe_text}")
                 print(f"  Entry: \033[36m{entry:>10.2f}\033[0m  Mark: \033[36m{mark:>10.2f}\033[0m  ROE: {roe_c(roe)}")
                 print(f"  Size:  {size:>8.4f}    Margin: {margin:>8.2f}   Liq: {liq:>10.2f}")

@@ -7,6 +7,7 @@ scalper_config.py
 # Runtime / local data
 *.log
 spread_learnings.json
+bot_state.json
 __pycache__/
 *.pyc
 *.pyo
@@ -14,3 +15,7 @@ __pycache__/
 
 # Vendored dependencies (use requirements.txt)
 lib/
+
+# Backtest data (generated, can be recreated)
+backtest/*.json
+backtest/*.png

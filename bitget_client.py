@@ -289,26 +289,36 @@ def set_position_sl_tp(
     return result
 
 
-def cancel_tpsl_orders(symbol: str) -> dict:
-    """Loescht ALLE offenen TPSL-Orders fuer ein Symbol (ohne ID-Liste)."""
+def cancel_tpsl_orders(symbol: str, extra_types: list | None = None) -> dict:
+    """Loescht ALLE offenen TPSL-Orders fuer ein Symbol (ohne ID-Liste).
+
+    Cancelt standardmaessig profit_plan + loss_plan (planType='profit_loss').
+    extra_types: zusaetzliche planType-Werte wie ['pos_loss', 'pos_profit']
+    (nötig nach place-pos-tpsl, das eigene Order-Typen erzeugt).
+    """
     if config.DRY_RUN:
         logger.info(f"[DRY-RUN] Cancel TPSL {symbol}")
         return {"code": "00000"}
+    result = {"code": "00000"}
+    types_to_cancel = ["profit_loss", "profit_plan", "loss_plan"]
+    if extra_types:
+        types_to_cancel.extend(extra_types)
     try:
-        # Gemaess Bitget API: OHNE orderIdList loescht ALLE Orders fuer symbol+productType
-        result = _post(
-            "/api/v2/mix/order/cancel-plan-order",
-            {
-                "symbol": symbol,
-                "productType": config.PRODUCT_TYPE,
-                "marginCoin": config.MARGIN_COIN,
-                "planType": "profit_loss",
-            },
-        )
-        if result.get("code") == "00000":
-            logger.info(f"[{symbol}] Alle TPSL-Orders geloescht ✅")
-        else:
-            logger.warning(f"[{symbol}] Cancel TPSL: {result.get('msg')}")
+        for pt in types_to_cancel:
+            r = _post(
+                "/api/v2/mix/order/cancel-plan-order",
+                {
+                    "symbol": symbol,
+                    "productType": config.PRODUCT_TYPE,
+                    "marginCoin": config.MARGIN_COIN,
+                    "planType": pt,
+                },
+            )
+            if r.get("code") == "00000":
+                logger.debug(f"  [{symbol}] Cancel planType={pt} ✅")
+            else:
+                logger.debug(f"  [{symbol}] Cancel planType={pt}: {r.get('msg')}")
+        logger.info(f"[{symbol}] Alle TPSL-Orders geloescht ✅")
         return result
     except Exception as e:
         logger.warning(f"[{symbol}] Cancel TPSL Fehler (nicht kritisch): {e}")

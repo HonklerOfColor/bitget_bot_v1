@@ -1,0 +1,114 @@
+#!/usr/bin/env python3
+"""
+Dual-Bot Dashboard — V1 (Spread-Scalper) + V2 (MRv2)
+=====================================================
+Live-Update alle 5s. Zeigt offene Positionen beider Bots.
+Strg+C zum Beenden.
+"""
+import json
+import subprocess
+import time
+import signal
+import sys
+from datetime import datetime
+from pathlib import Path
+
+V1_DIR = Path("/Users/andreas/bitget_bot_v1")
+V2_DIR = Path("/Users/andreas/bitget_bot_V2")
+FETCH_SCRIPT = V1_DIR / "fetch_bot.py"
+V1_VENV = V1_DIR / ".venv" / "bin" / "python3"
+V2_VENV = V2_DIR / ".venv" / "bin" / "python3"
+REFRESH = 5  # Sekunden
+
+
+def fetch_bot(bot_dir, venv_python):
+    result = subprocess.run(
+        [str(venv_python), str(FETCH_SCRIPT), str(bot_dir)],
+        capture_output=True, text=True, timeout=30,
+    )
+    if result.returncode != 0:
+        return [], f"Fehler: {result.stderr.strip()}"
+    try:
+        return json.loads(result.stdout), None
+    except json.JSONDecodeError as e:
+        return [], f"JSON-Fehler: {e}"
+
+
+def fmt(v, decimals=2):
+    if v is None:
+        return "---"
+    return f"{v:.{decimals}f}"
+
+
+def render():
+    v1_positions, v1_err = fetch_bot(V1_DIR, V1_VENV)
+    v2_positions, v2_err = fetch_bot(V2_DIR, V2_VENV)
+
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    lines = []
+
+    lines.append(f"{'='*80}")
+    lines.append(f"  📊 DUAL-BOT DASHBOARD  —  {now}  (Refresh: alle {REFRESH}s | Strg+C = Ende)")
+    lines.append(f"{'='*80}")
+
+    # V1
+    lines.append(f"\n  🔴 V1 — Spread-Scalper (LIVE)")
+    if v1_err:
+        lines.append(f"  ❌ {v1_err}")
+    elif not v1_positions:
+        lines.append(f"  📭 Keine offenen Positionen")
+    else:
+        lines.append(f"  {'Symbol':<10} {'Side':<7} {'Size':>10} {'Entry':>12} {'Mark':>12} {'PnL':>10} {'ROE':>7} {'SL':>12} {'TP':>12}")
+        lines.append(f"  {'─'*92}")
+        for p in v1_positions:
+            margin = p.get("margin", 0)
+            roe = (p["pnl"] / margin) * 100 if margin > 0 else 0
+            lines.append(f"  {p['symbol']:<10} {p['side'].upper():<7} {fmt(p['size'],4):>10} "
+                         f"{fmt(p['entry'],4):>12} {fmt(p['mark'],4):>12} "
+                         f"{p['pnl']:>+10.2f} {roe:>+6.1f}% {fmt(p['sl']):>12} {fmt(p['tp']):>12}")
+
+    # V2
+    lines.append(f"\n  🔵 V2 — MRv2 RSI (DEMO)")
+    if v2_err:
+        lines.append(f"  ❌ {v2_err}")
+    elif not v2_positions:
+        lines.append(f"  📭 Keine offenen Positionen")
+    else:
+        lines.append(f"  {'Symbol':<10} {'Side':<7} {'Size':>10} {'Entry':>12} {'Mark':>12} {'PnL':>10} {'ROE':>7} {'SL':>12} {'TP':>12}")
+        lines.append(f"  {'─'*92}")
+        for p in v2_positions:
+            margin = p.get("margin", 0)
+            roe = (p["pnl"] / margin) * 100 if margin > 0 else 0
+            lines.append(f"  {p['symbol']:<10} {p['side'].upper():<7} {fmt(p['size'],4):>10} "
+                         f"{fmt(p['entry'],4):>12} {fmt(p['mark'],4):>12} "
+                         f"{p['pnl']:>+10.2f} {roe:>+6.1f}% {fmt(p['sl']):>12} {fmt(p['tp']):>12}")
+
+    # Summary
+    total_v1 = sum(p["pnl"] for p in v1_positions)
+    total_v2 = sum(p["pnl"] for p in v2_positions)
+    lines.append(f"\n{'='*80}")
+    lines.append(f"  V1 PnL: {total_v1:>+8.2f} USDT  |  V2 PnL: {total_v2:>+8.2f} USDT  |  "
+                 f"Gesamt: {total_v1+total_v2:>+8.2f} USDT")
+    lines.append(f"{'='*80}")
+
+    return "\n".join(lines)
+
+
+def run_live():
+    signal.signal(signal.SIGINT, lambda s, f: sys.exit(0))
+    while True:
+        print("\033c", end="")          # clear screen (ESC c)
+        out = render()
+        print(out, flush=True)
+        time.sleep(REFRESH)
+
+
+def main():
+    print(render())
+
+
+if __name__ == "__main__":
+    if "--once" in sys.argv:
+        main()
+    else:
+        run_live()

@@ -11,34 +11,44 @@ import sys, os, time, json, threading
 from datetime import datetime
 from loguru import logger
 
-sys.path.insert(0, "/Users/andreas/bitget_bot")
+sys.path.insert(0, "/Users/andreas/bitget_bot_v1")
 import bitget_client as client
 
 # ── Config ───────────────────────────────────────────────────────────────────
 SYMBOLS = ["SOLUSDT", "BTCUSDT", "ETHUSDT", "XRPUSDT"]
 LOOP_INTERVAL = 2          # Alle 2 Sekunden
-LEVERAGE = 5  # muss mit exchange übereinstimmen (API zeigt leverage=5)
+LEVERAGE = 3  # 3× Hebel (Backtest: V10 1× verliert 10× weniger als 5×)
 OFFSET_PCT = 0.0001        # 0.01% Offset (hauchduenn, um im Orderbook zu bleiben)
 MAX_SPREAD_PCT = 0.005     # Max 0.5% Spread (sonst zu volatil)
 TELEGRAM_ON = True
+
+# 🧭 Hedge Mode — SHORT-Only (Backtest: Short 13× profitabler als Long)
+SHORT_ONLY = True      # True = SHORT-Only (Backtest-Ranking Platz 3)
+EMAFILTER = False       # Trendfilter: True = nur in EMA-Richtung traden
+
+# 🧠 Trade Analysis — DeepSeek nach jedem Trade
+ANALYSIS_ENABLED = True   # False = deaktivieren (keine API-Kosten)
+
+# ── Shared State (Dashboard-Kommunikation) ──
+SHARED_STATE_PATH = os.path.join(os.path.dirname(__file__), "bot_state.json")
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
+DEEPSEEK_MODEL = "deepseek-chat"      # DeepSeek-V3 (Flash), wechseln auf "deepseek-reasoner" für DeepSeek-R1/Pro
 
 # Symbol-spezifische Mindestmengen (updatet fuer 5 USDT Minimum UND Bitget Min-Qty Limits)
 MIN_SIZES = {
     "BTCUSDT": 0.001,   # min_qty=0.001 → ~$63 (groesser als 5 USDT min)
     "ETHUSDT": 0.05,    # min_qty erhöht auf 0.05 (war 0.01, zu klein) → ~$150
     "SOLUSDT": 0.2,     # min_qty erhöht auf 0.2 (war 0.1) → ~$16
-    "XRPUSDT": 5.0,     # min_qty erhöht auf 5.0 (war 2.0) → ~$3.50
+    "XRPUSDT": 5,       # min_qty=1, 5×$1.10=$5.50 > $5 min, volumePlace=0 (integer)
 }
 
-# 📊 Multi-Level TP/SL Strategy
+# 📊 Single-Level TP: 100% bei 3×ATR (Backtest: TP 3× = höchster PF 0.64)
 TP_LEVELS = [
-    {"pct": 0.15, "atr_mult": 3.0, "label": "TP1"},   # 15% @ 3.0× ATR
-    {"pct": 0.35, "atr_mult": 6.0, "label": "TP2"},   # 35% @ 6.0× ATR
-    {"pct": 0.50, "atr_mult": 9.0, "label": "TP3"},   # 50% @ 9.0× ATR
+    {"pct": 1.0, "atr_mult": 3.0, "label": "TP1"},   # 100% @ 3.0× ATR
 ]
 SL_BASE_MULT = 0.30     # 0.30× ATR baseline
 SL_MAX_MULT = 0.60      # 0.60× ATR bei Verlustserie (proportional zu SL_BASE)
-BREAKEVEN_PNL_PCT = 0.02  # +2% unrealized → move SL to entry
+BREAKEVEN_PNL_PCT = 0.03  # +3% unrealized → move SL to entry
 LOSS_STREAK_THRESHOLD = 3  # Nach 3 Verlusten: scale SL bis 0.60×
 
 # Preis-Rundung (Stellen nach Komma)
@@ -46,8 +56,21 @@ PRICE_PLACES = {
     "SOLUSDT": 3,
     "BTCUSDT": 1,
     "ETHUSDT": 1,
-    "XRPUSDT": 4,
+    "XRPUSDT": 4,       # pricePlace=4
 }
+
+# 🎯 Spread-Penetration pro Symbol (0.0 = Bid, 1.0 = Ask)
+# Default: SHORT=0.7, LONG=0.3. XRP braucht aggressivere Einstiege bei 1-Tick-Spread.
+SPREAD_PEN_SHORT = {
+    "XRPUSDT": 0.25,    # SHORT bei 25% → 1.0963 (Bid+1) statt 1.0964 (Ask)
+}
+SPREAD_PEN_LONG = {}    # Keine Overrides nötig (LONG via Hedge, SHORT_ONLY)
+
+# 📡 Coinglass-style Sentiment Signals (via Bitget API — kein externer API-Key nötig)
+MAX_FUNDING_RATE = 0.0005     # 0.05% — SHORT nur wenn Funding darunter (sonst extreme crowded long)
+OI_MIN_CHANGE_PCT = -10       # Min OI-Change % im Ticker (Filter für Illiquidität)
+# 📊 Richtungssignal — Funding Rate Schwelle
+FUNDING_SIGNAL_THRESHOLD = 0.0001  # 0.01% — Funding > +0.01% → SHORT, < -0.01% → LONG
 
 # Logger
 logger.remove()
@@ -61,17 +84,19 @@ class SpreadScalper:
         self.positions = {}   # symbol -> {
                               #   "side": "long"/"short"
                               #   "entry": price, "size": qty, "mark_price": current
-                              #   "tp_level": 0-3 (welcher TP gerade aktiv)
-                              #   "tp_prices": [tp1, tp2, tp3]
+                              #   "tp_level": 0 (aktuelles TP-Level)
+                              #   "tp_prices": [tp]
                               #   "sl_price": current SL
                               #   "loss_streak": consecutive losses
                               # }
         self.pending_orders = {}  # symbol -> {"buy_id": "...", "sell_id": "...", "ts": timestamp}
         self.last_pnl_check = {}  # symbol -> timestamp (10s-TP1-Cooldown)
+        self.peak_roe = {}        # symbol -> höchster ROE% (für Trailing Stop)
         
         # 🧠 Trade Learner
         self.trade_log = []  # Abgeschlossene Trades
         self.stats = {}      # Statistik pro Symbol
+        self.analysis_lock = threading.Lock()
         self.load_learnings()
         
         logger.info("=" * 50)
@@ -79,6 +104,8 @@ class SpreadScalper:
         logger.info(f"   Symbole: {SYMBOLS}")
         logger.info(f"   Intervall: {LOOP_INTERVAL}s | Hebel: {LEVERAGE}x")
         logger.info(f"   Offset: {OFFSET_PCT*100:.3f}%")
+        mode = "SHORT-Only" if SHORT_ONLY else "LONG+SHORT (Funding-Signal)"
+        logger.info(f"   Modus: {mode} | EMA-Filter: {EMAFILTER}")
         self.print_stats()
         logger.info("=" * 50)
         
@@ -86,7 +113,7 @@ class SpreadScalper:
         self._check_existing_tpsl()
     
     def _check_existing_tpsl(self):
-        """Setze TP/SL fuer bestehende Positionen ohne — nutze ATR-basierte Multi-Level TP"""
+        """Setze TP/SL fuer bestehende Positionen ohne — nutze ATR-basiertes Single TP"""
         for symbol in SYMBOLS:
             try:
                 pos_raw = client.get_position(symbol)  # Volle raw API-Response
@@ -106,15 +133,27 @@ class SpreadScalper:
                     entry_price = float(pos_raw.get("openPriceAvg", pos_raw.get("markPrice", 0)))
                     side = pos_raw["holdSide"]
                     
-                    # Berechne Multi-Level TP/SL
+                    # Berechne Single TP/SL
                     levels = self.calc_tp_sl_levels(symbol, entry_price, side, atr)
                     if not levels:
                         continue
                     
                     logger.info(f"  📍 {side.upper()}: Entry={entry_price}, ATR={atr:.4f}")
-                    logger.info(f"     TP1={levels['tp_prices'][0]}, TP2={levels['tp_prices'][1]}, TP3={levels['tp_prices'][2]}, SL={levels['sl']}")
+                    logger.info(f"     TP={levels['tp_prices'][0]}, SL={levels['sl']}")
                     
                     self.set_tpsl_for_position(symbol, side, levels["tp_prices"], levels["sl"], float(pos_raw["total"]))
+                    
+                    # ⬇️ Bot-seitiges SL/TP-Tracking (Demo-fähig)
+                    if symbol not in self.positions:
+                        self.positions[symbol] = {}
+                    self.positions[symbol].update({
+                        "tp_prices": levels["tp_prices"],
+                        "sl": levels["sl"],
+                        "side": side,
+                        "entry": entry_price,
+                        "size": float(pos_raw["total"]),
+                        "mark_price": float(pos_raw.get("markPrice", entry_price)),
+                    })
             except Exception as e:
                 logger.error(f"  ❌ {symbol}: {type(e).__name__}: {e}")
     
@@ -162,8 +201,59 @@ class SpreadScalper:
             logger.debug(f"  ⏭️  ATR calc ({symbol}): {e}")
             return None
     
+    def _calc_ema(self, symbol, period=20):
+        """Berechne EMA(period) aus 1H Kerzen — für Trendfilter"""
+        try:
+            klines = client.get_candles(symbol, "1H", limit=period * 3)
+            if not klines or len(klines) < period:
+                return None
+            closes = [float(k[4]) for k in klines[-period * 2:]]
+            multiplier = 2 / (period + 1)
+            ema = sum(closes[:period]) / period
+            for price in closes[period:]:
+                ema = (price - ema) * multiplier + ema
+            return ema
+        except Exception as e:
+            logger.debug(f"  ⏭️ EMA calc ({symbol}): {e}")
+            return None
+    
+    def calc_chart_sl(self, symbol, entry_price, side):
+        """Berechne initialen SL basierend auf Chart-Struktur (letzte 20 1H Kerzen).
+        SHORT: SL = höchstes High + 0.1% Buffer
+        LONG:  SL = tiefstes Low - 0.1% Buffer
+        Fallback: 1.5× ATR wenn keine Chartdaten verfügbar
+        """
+        try:
+            klines = client.get_candles(symbol, "1H", limit=20)
+            if not klines or len(klines) < 5:
+                return None
+            
+            price_places = PRICE_PLACES.get(symbol, 2)
+            highs = [float(k[2]) for k in klines]
+            lows = [float(k[3]) for k in klines]
+            
+            if side == "short":
+                highest = max(highs)
+                sl = round(highest * 1.001, price_places)  # 0.1% über Hoch
+                # Sicherheit: SL nicht näher als 0.5× ATR
+                atr = self.calc_atr(symbol)
+                if atr and sl < entry_price + atr * 0.5:
+                    sl = round(entry_price + atr * 0.5, price_places)
+                return sl
+            else:  # long
+                lowest = min(lows)
+                sl = round(lowest * 0.999, price_places)  # 0.1% unter Tief
+                atr = self.calc_atr(symbol)
+                if atr and sl > entry_price - atr * 0.5:
+                    sl = round(entry_price - atr * 0.5, price_places)
+                return sl
+        except Exception as e:
+            logger.debug(f"  ⏭️ Chart-SL ({symbol}): {e}")
+            return None
+
     def calc_tp_sl_levels(self, symbol, entry_price, side, atr):
-        """Berechne Multi-Level TP/SL Preise basierend auf ATR"""
+        """Berechne TP/SL Preise basierend auf ATR.
+        SL ist immer 2% vom Entry (initial) — wird später dynamisch nachgeführt."""
         if not atr or atr <= 0:
             return None
         
@@ -177,14 +267,22 @@ class SpreadScalper:
                 tp = round(entry_price - atr * level["atr_mult"], price_places)
             tp_prices.append(tp)
         
-        # SL: dynamisch basierend auf loss_streak
-        loss_streak = self.stats.get(symbol, {}).get("consecutive_losses", 0)
-        sl_mult = min(SL_BASE_MULT + (loss_streak / LOSS_STREAK_THRESHOLD) * (SL_MAX_MULT - SL_BASE_MULT), SL_MAX_MULT)
-        
-        if side == "long":
-            sl = round(entry_price - atr * sl_mult, price_places)
-        else:  # short
-            sl = round(entry_price + atr * sl_mult, price_places)
+        # SL: Chart-basiert (letzte 20 Kerzen) — falls verfügbar, sonst 1.5× ATR
+        # Wird später dynamisch via ROE-Trailing nachgeführt
+        try:
+            sl = self.calc_chart_sl(symbol, entry_price, side)
+            if sl is None:
+                # Fallback: 1.5× ATR
+                if side == "long":
+                    sl = round(entry_price - atr * 1.5, price_places)
+                else:
+                    sl = round(entry_price + atr * 1.5, price_places)
+        except:
+            # Hard-Fallback: immer SL setzen, nie None
+            if side == "long":
+                sl = round(entry_price - atr * 1.5, price_places)
+            else:
+                sl = round(entry_price + atr * 1.5, price_places)
         
         return {"tp_prices": tp_prices, "sl": sl, "atr": atr}
     
@@ -229,6 +327,7 @@ class SpreadScalper:
             logger.warning(f"  ⚠️  Telegram error (record_trade): {tg_err}")
         
         self.save_learnings()
+        self._analyze_trade_deepseek(symbol, side, entry, exit_price, pnl, reason)
         
         icon = "✅" if pnl > 0 else "❌"
         logger.info(f"{icon} TRADE: {symbol} {side} | {pnl:+.4f} USDT | {reason}")
@@ -242,23 +341,74 @@ class SpreadScalper:
             wr = s["wins"] / max(s["trades"], 1) * 100
             logger.info(f"   {sym}: {s['trades']} Trades | {wr:.0f}% WR | {s['total_pnl']:+.2f} USDT")
     
-    def analyze_trade_with_mistral(self, symbol, side, entry, exit_price, pnl, reason):
-        """Rufe lokales Mistral fuer Trade-Analyse"""
-        try:
-            import requests
-            prompt = f"Spread-Trade {symbol} {side}: Entry {entry:.4f} -> Exit {exit_price:.4f}, {pnl:+.4f} USDT, {reason}. Warum? (1 Satz)"
-            resp = requests.post("http://localhost:11434/api/generate",
-                json={"model": "mistral:7b", "prompt": prompt,
-                      "stream": False, "temperature": 0.1},
-                timeout=15)
-            if resp.status_code == 200:
-                lesson = resp.json().get("response", "").strip()
-                logger.info(f"📖 {lesson}")
-                trade = self.trade_log[-1] if self.trade_log else {}
-                trade["lesson"] = lesson
-                self.save_learnings()
-        except:
-            pass
+    def _analyze_trade_deepseek(self, symbol, side, entry, exit_price, pnl, reason):
+        """Systematische Trade-Analyse via DeepSeek (Background-Thread)"""
+        if not ANALYSIS_ENABLED or not DEEPSEEK_API_KEY:
+            return
+
+        def _do_analysis():
+            try:
+                # Sammle Kontext: letzte 10 Trades für Pattern-Erkennung
+                recent = self.trade_log[-11:-1] if len(self.trade_log) > 11 else self.trade_log[:-1]
+                recent_summary = []
+                for t in recent[-8:]:
+                    r = t.get("reason", "")
+                    p = t.get("pnl", 0)
+                    recent_summary.append(f"  {t.get('side','?')} {t.get('symbol','')} | {p:+.4f} USDT | {r}")
+                recent_str = "\n".join(recent_summary[-6:]) if recent_summary else "  (erster Trade)"
+
+                # Statistik für dieses Symbol
+                s = self.stats.get(symbol, {})
+                symbol_wr = (s.get("wins", 0) / max(s.get("trades", 1), 1)) * 100
+                symbol_pnl = s.get("total_pnl", 0)
+
+                prompt = f"""Analyze this spread-scalp trade and extract ONE actionable lesson. Focus on patterns, not emotions.
+
+Symbol: {symbol} | Side: {side}
+Entry: {entry} → Exit: {exit_price}
+PnL: {pnl:+.4f} USDT | Reason: {reason}
+
+Symbol Stats:
+- Trades: {s.get('trades', 0)} | WR: {symbol_wr:.0f}% | PnL: {symbol_pnl:+.2f} USDT
+- Cons. Losses: {s.get('consecutive_losses', 0)}
+
+Recent trades (last {min(6, len(recent_summary))}):
+{recent_str}
+
+Answer in GERMAN, max 2 sentences:
+1) Was ist passiert? (1 Satz, technisch)
+2) Lektion? (1 Satz, handelbar — z.B. 'bei Spread<X besser warten' oder 'SOL reagiert empfindlich auf BTC-Drops')"""
+
+                import requests
+                resp = requests.post(
+                    "https://api.deepseek.com/beta/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "model": DEEPSEEK_MODEL,
+                        "messages": [
+                            {"role": "system", "content": "Du analysierst Scalping-Trades. Antworte in DEUTSCH. Maximal 2 Sätze. Keine Ausreden — nur Fakten und handelbare Lektionen."},
+                            {"role": "user", "content": prompt},
+                        ],
+                        "temperature": 0.3,
+                        "max_tokens": 200,
+                    },
+                    timeout=20,
+                )
+                if resp.status_code == 200:
+                    lesson = resp.json()["choices"][0]["message"]["content"].strip()
+                    with self.analysis_lock:
+                        if self.trade_log:
+                            self.trade_log[-1]["lesson"] = lesson
+                            logger.info(f"📖 {lesson}")
+                            self.save_learnings()
+
+            except Exception as e:
+                logger.debug(f"  ⏭️ DeepSeek analysis skipped: {e}")
+
+        threading.Thread(target=_do_analysis, daemon=True).start()
     
     def get_depth(self, symbol):
         """Hole Orderbook Depth"""
@@ -284,7 +434,80 @@ class SpreadScalper:
         except Exception as e:
             logger.debug(f"Depth Error {symbol}: {e}")
             return None
-    
+
+    def get_coinglass_signals(self, symbol):
+        """Hole Coinglass-artige Sentiment-Signale direkt aus Bitget-Ticker:
+        - fundingRate: wer zahlt wem (positiv = Longs zahlen Shorts)
+        - holdingAmount: Open Interest in Kontrakten
+        - change24h: Preisänderung
+        """
+        try:
+            ticker = client.get_ticker(symbol)
+            if not ticker:
+                return None
+
+            funding_rate = float(ticker.get("fundingRate", 0))       # z.B. 0.000091 = 0.0091%
+            oi_contracts = float(ticker.get("holdingAmount", 0))      # Open Interest in Kontrakten
+            oi_change_pct = float(ticker.get("changeUtc24h", 0)) * 100  # 24h OI-Änderung in %
+            price_change = float(ticker.get("change24h", 0)) * 100    # 24h Preisänderung in %
+
+            # OI in USD schätzen
+            mark = float(ticker.get("markPrice", 0))
+            oi_usd = oi_contracts * mark if mark > 0 else 0
+
+            return {
+                "funding_rate": funding_rate,       # decimal (0.000091)
+                "funding_pct": funding_rate * 100,  # Prozent (0.0091%)
+                "oi_contracts": oi_contracts,
+                "oi_usd": oi_usd,
+                "oi_change_pct": oi_change_pct,     # 24h in %
+                "price_change": price_change,        # 24h in %
+                "is_bullish_funding": funding_rate > 0,  # Longs zahlen Shorts
+            }
+        except Exception as e:
+            logger.debug(f"  ⏭️  Coinglass signals ({symbol}): {e}")
+            return None
+
+    def _decide_direction(self, symbol, cg, depth):
+        """Entscheide LONG oder SHORT basierend auf Funding Rate + EMA.
+        
+        Signal-Logik:
+        - Funding stark positiv (> +0.01%): Crowd ist long → SHORT (Contrarian)
+        - Funding stark negativ (< -0.01%): Crowd ist short → LONG (Contrarian)
+        - Funding neutral: EMA-Trendfilter (wenn aktiv) oder neutral → skip
+        - SHORT_ONLY=True: immer SHORT (wie bisher)
+        
+        Returns: \"long\", \"short\", oder None (kein Trade)
+        """
+        if SHORT_ONLY:
+            return "short"
+
+        fr = cg["funding_rate"]
+        
+        # 📡 Starkes Funding-Signal
+        if fr > FUNDING_SIGNAL_THRESHOLD:
+            logger.debug(f"  📡 Funding {cg['funding_pct']:+.4f}% → SHORT (Crowd long)")
+            return "short"
+        elif fr < -FUNDING_SIGNAL_THRESHOLD:
+            logger.debug(f"  📡 Funding {cg['funding_pct']:+.4f}% → LONG (Crowd short)")
+            return "long"
+        
+        # 📡 Neutrales Funding → EMA-Trendfilter
+        if EMAFILTER:
+            ema = self._calc_ema(symbol)
+            if ema is not None:
+                mid = depth["mid"]
+                if mid > ema:
+                    logger.debug(f"  📡 Preis ${mid:.2f} > EMA ${ema:.2f} → LONG")
+                    return "long"
+                else:
+                    logger.debug(f"  📡 Preis ${mid:.2f} < EMA ${ema:.2f} → SHORT")
+                    return "short"
+        
+        # Kein klares Signal → skip
+        logger.debug(f"  ⏭️  Funding neutral, kein EMA-Filter — kein Trade")
+        return None
+
     def get_position(self, symbol):
         """Aktuelle Position abrufen"""
         try:
@@ -304,7 +527,7 @@ class SpreadScalper:
     def cancel_all_orders(self, symbol):
         """Alle offenen Orders für Symbol löschen"""
         try:
-            client.cancel_tpsl_orders(symbol)
+            client.cancel_tpsl_orders(symbol, extra_types=['pos_loss', 'pos_profit'])
         except:
             pass
     
@@ -428,29 +651,52 @@ class SpreadScalper:
     def _cancel_plan_orders(self, symbol):
         """Cancel ALL TPSL-Orders für ein Symbol (ohne ID-Liste)."""
         try:
-            client.cancel_tpsl_orders(symbol)
+            client.cancel_tpsl_orders(symbol, extra_types=['pos_loss', 'pos_profit'])
         except:
             pass
     
     def _fallback_tpsl(self, symbol, side, tp_prices, sl_price, size):
-        """Fallback: place-pos-tpsl (nur 1 TP)."""
+        """Setze TP/SL via place-pos-tpsl (position-level, sichtbar in stopLoss-Feld).
+        Funktioniert auf Live (Demo akzeptiert den Call, persistiert aber nicht)."""
         try:
             tp_price = tp_prices[0]
-            result = client._post("/api/v2/mix/order/place-pos-tpsl", {
+
+            # SL-Fallback falls None
+            if sl_price is None:
+                price_places = PRICE_PLACES.get(symbol, 2)
+                try:
+                    ticker = client.get_ticker(symbol)
+                    mark = float(ticker['last']) if ticker else None
+                except:
+                    mark = None
+                if mark:
+                    if side == "short":
+                        sl_price = round(mark * 1.015, price_places)
+                    else:
+                        sl_price = round(mark * 0.985, price_places)
+                else:
+                    entry = self.positions.get(symbol, {}).get("entry")
+                    if entry:
+                        sl_price = round(entry * 1.015, price_places) if side == "short" else round(entry * 0.985, price_places)
+                    else:
+                        sl_price = 0
+                logger.warning(f"  ⚠️  SL war None, Fallback auf {sl_price}")
+
+            payload = {
                 "symbol": symbol,
                 "productType": "USDT-FUTURES",
                 "marginCoin": "USDT",
                 "holdSide": side,
                 "stopSurplusTriggerPrice": f"{tp_price}",
                 "stopSurplusTriggerType": "mark_price",
-                "stopSurplusExecutePrice": f"{tp_price}",
                 "stopLossTriggerPrice": f"{sl_price}",
                 "stopLossTriggerType": "mark_price",
-                "stopLossExecutePrice": f"{sl_price}",
-            })
-            if result.get("code") == "00000":
-                logger.info(f"  ⚠️  Fallback TP1={tp_price} SL={sl_price}")
-                # Update statt Überschreiben — sl_protected Flag erhalten
+            }
+            result = client._post("/api/v2/mix/order/place-pos-tpsl", payload)
+            ok = result.get("code") == "00000"
+
+            if ok:
+                logger.info(f"  ✅ pos-tpsl TP={tp_price} SL={sl_price}")
                 if symbol not in self.positions:
                     self.positions[symbol] = {}
                 self.positions[symbol].update({
@@ -459,12 +705,11 @@ class SpreadScalper:
                     "sl": sl_price,
                     "original_size": size,
                 })
-                # sl_protected initialisieren falls nicht gesetzt
-                self.positions[symbol].setdefault("sl_protected_level", 0)
             else:
-                logger.warning(f"  ⚠️  Fallback Fehler: {result.get('msg','?')}")
+                msg = result.get("msg", "?")
+                logger.warning(f"  ⚠️  pos-tpsl Fehler ({symbol}): code={result.get('code')} {msg}")
         except Exception as e:
-            logger.warning(f"  ⚠️  Fallback Exception: {e}")
+            logger.warning(f"  ⚠️  pos-tpsl Exception: {e}")
     
     def _notify_sl_move(self, symbol, side, pnl_pct, new_sl):
         """Sende Telegram bei SL-Verschiebung."""
@@ -517,7 +762,7 @@ class SpreadScalper:
                         if atr:
                             levels = self.calc_tp_sl_levels(symbol, float(pos["entry"]), pos["side"], atr)
                             if levels:
-                                logger.info(f"  🎯 Multi-Level TP retry: {levels['tp_prices']}, SL: {levels['sl']}")
+                                logger.info(f"  🎯 TP retry: {levels['tp_prices']}, SL: {levels['sl']}")
                                 self.set_tpsl_for_position(symbol, pos["side"], levels["tp_prices"], levels["sl"], float(pos["size"]))
                                 # Bei Erfolg in positions speichern
                                 if symbol in self.positions:
@@ -533,8 +778,8 @@ class SpreadScalper:
                     
                     if pos["side"] == "long":
                         # LONG: TP wenn Marktpreis >= TP-Preis
-                        # SL wenn Marktpreis <= SL-Preis
-                        sl_price = self.positions.get(symbol, {}).get("sl", depth["bid"])
+                        # SL nur prüfen wenn gesetzt (None = Nur Trailing)
+                        sl_price = self.positions.get(symbol, {}).get("sl")
                         if mark_price >= tp_price:
                             logger.info(f"🎯 {symbol} LONG TP erreicht @ {mark_price:.2f} >= {tp_price:.2f}")
                             exit_price = mark_price
@@ -542,16 +787,18 @@ class SpreadScalper:
                             self.record_trade(symbol, "long", pos["entry"], exit_price, actual_pnl, "TP")
                             self.place_market_close(symbol, pos["side"], pos["size"])
                             self.positions.pop(symbol, None)
-                        elif mark_price <= sl_price:
+                            self.peak_roe.pop(symbol, None)
+                        elif sl_price is not None and mark_price <= sl_price:
                             logger.warning(f"🛑 {symbol} LONG SL hit @ {mark_price:.2f} <= {sl_price:.2f}")
                             actual_pnl = (sl_price - pos["entry"]) * pos["size"]
                             self.record_trade(symbol, "long", pos["entry"], sl_price, actual_pnl, "SL")
                             self.place_market_close(symbol, pos["side"], pos["size"])
                             self.positions.pop(symbol, None)
+                            self.peak_roe.pop(symbol, None)
                     else:
                         # SHORT: TP wenn Marktpreis <= TP-Preis
-                        # SL wenn Marktpreis >= SL-Preis
-                        sl_price = self.positions.get(symbol, {}).get("sl", depth["ask"])
+                        # SL nur prüfen wenn gesetzt (None = Nur Trailing)
+                        sl_price = self.positions.get(symbol, {}).get("sl")
                         if mark_price <= tp_price:
                             logger.info(f"🎯 {symbol} SHORT TP erreicht @ {mark_price:.2f} <= {tp_price:.2f}")
                             exit_price = mark_price
@@ -559,97 +806,74 @@ class SpreadScalper:
                             self.record_trade(symbol, "short", pos["entry"], exit_price, actual_pnl, "TP")
                             self.place_market_close(symbol, pos["side"], pos["size"])
                             self.positions.pop(symbol, None)
-                        elif mark_price >= sl_price:
+                            self.peak_roe.pop(symbol, None)
+                        elif sl_price is not None and mark_price >= sl_price:
                             logger.warning(f"🛑 {symbol} SHORT SL hit @ {mark_price:.2f} >= {sl_price:.2f}")
                             actual_pnl = (pos["entry"] - sl_price) * pos["size"]
                             self.record_trade(symbol, "short", pos["entry"], sl_price, actual_pnl, "SL")
                             self.place_market_close(symbol, pos["side"], pos["size"])
                             self.positions.pop(symbol, None)
+                            self.peak_roe.pop(symbol, None)
                     
-                    # ── PnL-basierte SL-Protection (alle 10s prüfen) ──
-                    # Bei PnL > 1% wird der SL auf Entry (Breakeven) gezogen,
-                    # damit der Trade risikofrei weiterlaufen kann.
-                    # TPs bleiben unverändert (Gewinne laufen lassen).
+                    # ── Dynamischer SL (alle 10s nachgeführt) ──
+                    # ROE-basiertes Trailing: SL 2% unter Peak-ROE.
+                    # Läuft bei jeder offenen Position kontinuierlich mit.
                     if pos and tp_prices:
                         now = time.time()
                         last = self.last_pnl_check.get(symbol, 0)
                         if now - last >= 10:
                             self.last_pnl_check[symbol] = now
                             try:
-                                unrealized = float(pos.get("pnl", 0))
-                                entry = float(pos["entry"])
-                                notional = float(pos["size"]) * float(pos.get("markPrice", depth["mid"]))
-                                if notional <= 0:
-                                    notional = float(pos["size"]) * entry * LEVERAGE
-                                # ROE = PnL / Margin (wie Bitget UI)
-                                margin = notional / LEVERAGE if notional > 0 else 0
-                                pnl_pct = unrealized / margin * 100 if margin > 0 else 0
+                                current_sl = self.positions.get(symbol, {}).get("sl")
+                                mark = float(pos.get("markPrice", depth["mid"]))
+                                side = pos["side"]
                                 
-                                if pnl_pct > 1.0:
-                                    prot_level = self.positions.get(symbol, {}).get("sl_protected_level", 0)
-                                    
-                                    current_sl = self.positions.get(symbol, {}).get("sl")
-                                    mark = float(pos.get("markPrice", depth["mid"]))
-                                    
-                                    if current_sl is not None:
-                                        # sl_protected_level: 0=kein, 1=Entry±1%, 2=Entry±2%
-                                        prot_level = self.positions.get(symbol, {}).get("sl_protected_level", 0)
-                                        
-                                        if pnl_pct > 4.0 and prot_level < 2:
-                                            # Ab 4% → SL auf Entry±2% verschieben
-                                            target_mult = 1.02 if pos["side"] == "long" else 0.98
-                                            fallback_mult = 0.996 if pos["side"] == "long" else 1.004
-                                            fallback_mark = mark * fallback_mult
-                                            new_sl = round(entry * target_mult, PRICE_PLACES.get(symbol, 2))
-                                            
-                                            if pos["side"] == "long":
-                                                if new_sl >= mark:
-                                                    new_sl = round(fallback_mark, PRICE_PLACES.get(symbol, 2))
-                                                if new_sl > current_sl and new_sl < mark:
-                                                    self.positions[symbol]["sl"] = new_sl
-                                                    self.positions[symbol]["sl_protected_level"] = 2
-                                                    self.set_tpsl_for_position(symbol, "long", tp_prices, new_sl, float(pos["size"]))
-                                                    logger.info(f"🔒 {symbol} LONG: PnL={pnl_pct:.1f}% → SL auf {new_sl} (Entry+2%)")
-                                                    self._notify_sl_move(symbol, "LONG", pnl_pct, new_sl)
-                                            else:  # short
-                                                if new_sl <= mark:
-                                                    new_sl = round(fallback_mark, PRICE_PLACES.get(symbol, 2))
-                                                if new_sl < current_sl and new_sl > mark:
-                                                    self.positions[symbol]["sl"] = new_sl
-                                                    self.positions[symbol]["sl_protected_level"] = 2
-                                                    self.set_tpsl_for_position(symbol, "short", tp_prices, new_sl, float(pos["size"]))
-                                                    logger.info(f"🔒 {symbol} SHORT: PnL={pnl_pct:.1f}% → SL auf {new_sl} (Entry-2%)")
-                                                    self._notify_sl_move(symbol, "SHORT", pnl_pct, new_sl)
-                                                    
-                                        elif pnl_pct > 1.0 and prot_level == 0:
-                                            if pos["side"] == "long":
-                                                new_sl = round(entry * 1.01, PRICE_PLACES.get(symbol, 2))
-                                                if new_sl >= mark:
-                                                    new_sl = round(mark * 0.998, PRICE_PLACES.get(symbol, 2))
-                                                if new_sl > current_sl and new_sl < mark:
-                                                    self.positions[symbol]["sl"] = new_sl
-                                                    self.positions[symbol]["sl_protected_level"] = 1
-                                                    self.set_tpsl_for_position(symbol, "long", tp_prices, new_sl, float(pos["size"]))
-                                                    logger.info(f"🔒 {symbol} LONG: PnL={pnl_pct:.1f}% → SL auf {new_sl} (Entry+1% od. Markt-0.2%)")
-                                                    self._notify_sl_move(symbol, "LONG", pnl_pct, new_sl)
-                                                elif new_sl <= current_sl:
-                                                    logger.debug(f"🔒 {symbol}: SL bereits auf/über {current_sl}")
-                                            else:  # short
-                                                new_sl = round(entry * 0.99, PRICE_PLACES.get(symbol, 2))
-                                                if new_sl <= mark:
-                                                    new_sl = round(mark * 1.002, PRICE_PLACES.get(symbol, 2))
-                                                if new_sl < current_sl and new_sl > mark:
-                                                    self.positions[symbol]["sl"] = new_sl
-                                                    self.positions[symbol]["sl_protected_level"] = 1
-                                                    self.set_tpsl_for_position(symbol, "short", tp_prices, new_sl, float(pos["size"]))
-                                                    logger.info(f"🔒 {symbol} SHORT: PnL={pnl_pct:.1f}% → SL auf {new_sl} (Entry-1% od. Markt+0.2%)")
-                                                    self._notify_sl_move(symbol, "SHORT", pnl_pct, new_sl)
-                                                elif new_sl >= current_sl:
-                                                    logger.debug(f"🔒 {symbol}: SL bereits auf/unter {current_sl}")
-                                        elif prot_level > 0:
-                                            logger.debug(f"🔒 {symbol}: SL bereits geschützt (Level {prot_level})")
-                            except Exception as pnl_e:
-                                logger.debug(f"  ⚠️ PnL-Check {symbol}: {pnl_e}")
+                                entry_price = float(pos["entry"])
+                                pos_size = float(pos["size"])
+                                pnl = float(pos.get("pnl", 0))
+                                margin = pos_size * mark / LEVERAGE
+                                roe_pct = (pnl / margin) * 100 if margin > 0 else 0
+
+                                # Peak-ROE aktualisieren
+                                if roe_pct > self.peak_roe.get(symbol, -9999):
+                                    self.peak_roe[symbol] = roe_pct
+
+                                # ROE-Trailing: aktiv ab 3% Peak-ROE
+                                # SL immer auf Break-Even (Entry) sobald 3% erreicht,
+                                # danach 2% unter dem höchsten erreichten ROE nachführen
+                                if self.peak_roe.get(symbol, 0) >= (BREAKEVEN_PNL_PCT * 100):
+                                    target_roe = self.peak_roe[symbol] - 2.0  # 2% unter Peak
+                                    pnl_target = target_roe / 100 * margin
+                                    if side == "short":
+                                        new_sl = round(entry_price - pnl_target / pos_size, PRICE_PLACES.get(symbol, 2))
+                                        if current_sl is None:
+                                            if new_sl > mark:
+                                                self.positions[symbol]["sl"] = new_sl
+                                                self.set_tpsl_for_position(symbol, "short", tp_prices, new_sl, pos_size)
+                                                logger.info(f"🔒 {symbol} SHORT: Trailing-SL gesetzt → {new_sl} (Peak={self.peak_roe[symbol]:.1f}%)")
+                                                self._notify_sl_move(symbol, "SHORT", roe_pct, new_sl)
+                                        else:
+                                            if new_sl > mark and new_sl < current_sl:
+                                                self.positions[symbol]["sl"] = new_sl
+                                                self.set_tpsl_for_position(symbol, "short", tp_prices, new_sl, pos_size)
+                                                logger.info(f"🔒 {symbol} SHORT: SL enger → {new_sl} (Peak={self.peak_roe[symbol]:.1f}%)")
+                                                self._notify_sl_move(symbol, "SHORT", roe_pct, new_sl)
+                                    else:  # long
+                                        new_sl = round(entry_price + pnl_target / pos_size, PRICE_PLACES.get(symbol, 2))
+                                        if current_sl is None:
+                                            if new_sl < mark:
+                                                self.positions[symbol]["sl"] = new_sl
+                                                self.set_tpsl_for_position(symbol, "long", tp_prices, new_sl, pos_size)
+                                                logger.info(f"🔒 {symbol} LONG: Trailing-SL gesetzt → {new_sl} (Peak={self.peak_roe[symbol]:.1f}%)")
+                                                self._notify_sl_move(symbol, "LONG", roe_pct, new_sl)
+                                        else:
+                                            if new_sl < mark and new_sl > current_sl:
+                                                self.positions[symbol]["sl"] = new_sl
+                                                self.set_tpsl_for_position(symbol, "long", tp_prices, new_sl, pos_size)
+                                                logger.info(f"🔒 {symbol} LONG: SL enger → {new_sl} (Peak={self.peak_roe[symbol]:.1f}%)")
+                                                self._notify_sl_move(symbol, "LONG", roe_pct, new_sl)
+                            except Exception as sl_e:
+                                logger.debug(f"  ⚠️ Dynamischer SL {symbol}: {sl_e}")
                     
                 else:
                     depth = self.get_depth(symbol)
@@ -685,11 +909,14 @@ class SpreadScalper:
                     # Berechne Einstiegspreise (innerhalb des Spreads)
                     price_place = PRICE_PLACES.get(symbol, 2)
                     spread_size = depth["spread"]
-                    # BUY bei 30% vom Bid, SELL bei 70% vom Bid (innerhalb Spread)
-                    bid_price = depth["bid"] + (spread_size * 0.3)
-                    ask_price = depth["bid"] + (spread_size * 0.7)
-                    # Stelle sicher dass BUY < SELL
-                    bid_price = min(bid_price, ask_price - (spread_size * 0.1))
+                    # Per-Symbol Spread-Penetration (Default 30%/70%)
+                    short_pen = SPREAD_PEN_SHORT.get(symbol, 0.7)
+                    long_pen = SPREAD_PEN_LONG.get(symbol, 0.3)
+                    # BUY bei long_pen%, SELL bei short_pen% vom Spread
+                    bid_price = depth["bid"] + (spread_size * long_pen)
+                    ask_price = depth["bid"] + (spread_size * short_pen)
+                    # Stelle sicher dass BUY < SELL (minimaler Abstand)
+                    bid_price = min(bid_price, ask_price - (spread_size * 0.05))
                     bid_offset = round(bid_price, price_place)
                     ask_offset = round(ask_price, price_place)
                     order_size = MIN_SIZES.get(symbol, 0.1)
@@ -703,19 +930,36 @@ class SpreadScalper:
                         logger.warning(f"⚠️  {symbol}: size={order_size} Qty={order_size:.4f} @ ${depth['mid']:.4f} = ${notional_usd:.2f} < $5 — skippe")
                         continue
                     
-                    # TEMPORARY FIX: Bitget Demo Account ist auf HEDGE mode
-                    # Platziere NUR LONG oder SHORT (zufällig), nicht beides
-                    import random
-                    direction = random.choice(["long", "short"])  # Zufällig wählen
+                    # 📡 Coinglass Sentiment-Check vor Orderplatzierung
+                    cg = self.get_coinglass_signals(symbol)
+                    if cg is None:
+                        logger.debug(f"  ⏭️ {symbol}: Keine Coinglass-Signale — überspringe")
+                        continue
+
+                    # 📡 Richtung per Funding-Signal entscheiden
+                    direction = self._decide_direction(symbol, cg, depth)
+                    if direction is None:
+                        logger.debug(f"  ⏭️ {symbol}: Kein klares Richtungssignal — überspringe")
+                        continue
                     
                     if direction == "long":
+                        # 📡 Funding Rate Check für LONG: nicht longen wenn zu negativ (crowded shorts)
+                        if cg["funding_rate"] < -MAX_FUNDING_RATE:
+                            logger.info(f"  ⏭️ {symbol}: Funding {cg['funding_pct']:.4f}% < {-MAX_FUNDING_RATE*100:.2f}% — zu bearish, kein Long")
+                            logger.info(f"     📡 OI {cg['oi_usd']/1e6:.0f}M$ | 24h {cg['price_change']:+.2f}% | Funding {cg['funding_pct']:+.4f}%")
+                            continue
                         buy_id = self.place_limit_order(symbol, "long", round(bid_offset, price_place), order_size)
                         sell_id = None
-                        logger.info(f"  🎲 {symbol}: LONG Order (Hedge Mode)")
+                        logger.info(f"  📈 {symbol}: LONG Order | 📡 Funding {cg['funding_pct']:+.4f}% | OI {cg['oi_usd']/1e6:.0f}M$")
                     else:
+                        # 📡 Funding Rate Check für SHORT: nicht shorten wenn zu positiv (crowded longs)
+                        if cg["funding_rate"] > MAX_FUNDING_RATE:
+                            logger.info(f"  ⏭️ {symbol}: Funding {cg['funding_pct']:.4f}% > {MAX_FUNDING_RATE*100:.2f}% — zu bullish, kein Short")
+                            logger.info(f"     📡 OI {cg['oi_usd']/1e6:.0f}M$ | 24h {cg['price_change']:+.2f}% | Funding {cg['funding_pct']:+.4f}%")
+                            continue
                         buy_id = None
                         sell_id = self.place_limit_order(symbol, "short", round(ask_offset, price_place), order_size)
-                        logger.info(f"  🎲 {symbol}: SHORT Order (Hedge Mode)")
+                        logger.info(f"  📉 {symbol}: SHORT Order | 📡 Funding {cg['funding_pct']:+.4f}% | OI {cg['oi_usd']/1e6:.0f}M$")
                     
                     if buy_id or sell_id:
                         self.pending_orders[symbol] = {"buy_id": buy_id, "sell_id": sell_id, "ts": time.time()}
@@ -728,13 +972,13 @@ class SpreadScalper:
                         if status == "filled":
                             # BUY gefuellt -> LONG Position
                             logger.success(f"📈 {symbol} LONG gefuellt @ {price}")
-                            
-                            # Berechne ATR für Multi-Level TP/SL
+
+                            # Berechne ATR für TP/SL
                             atr = self.calc_atr(symbol)
                             if atr:
                                 levels = self.calc_tp_sl_levels(symbol, price, "long", atr)
                                 if levels:
-                                    logger.info(f"  🎯 Multi-Level TP: {levels['tp_prices']}, SL: {levels['sl']}")
+                                    logger.info(f"  🎯 TP: {levels['tp_prices']}, SL: {levels['sl']}")
                                     self.set_tpsl_for_position(symbol, "long", levels["tp_prices"], levels["sl"], order_size)
                                 else:
                                     # Fallback auf spread-basiert
@@ -750,11 +994,15 @@ class SpreadScalper:
                                 self.positions[symbol].update({
                                     "side": "long", "entry": price, "size": order_size,
                                     "mark_price": depth["mid"],
+                                    "tp_prices": levels["tp_prices"] if levels and levels.get("tp_prices") else [tp, tp, tp],
+                                    "sl": levels["sl"] if levels and levels.get("sl") else sl,
                                 })
                             else:
                                 self.positions[symbol] = {
                                     "side": "long", "entry": price, "size": order_size,
                                     "mark_price": depth["mid"],
+                                    "tp_prices": levels["tp_prices"] if levels and levels.get("tp_prices") else [tp, tp, tp],
+                                    "sl": levels["sl"] if levels and levels.get("sl") else sl,
                                 }
                             if sell_id:
                                 client._post("/api/v2/mix/order/cancel-order", {
@@ -768,13 +1016,13 @@ class SpreadScalper:
                         if status == "filled":
                             # SELL gefuellt -> SHORT Position
                             logger.success(f"📉 {symbol} SHORT gefuellt @ {price}")
-                            
-                            # Berechne ATR für Multi-Level TP/SL
+
+                            # Berechne ATR für TP/SL
                             atr = self.calc_atr(symbol)
                             if atr:
                                 levels = self.calc_tp_sl_levels(symbol, price, "short", atr)
                                 if levels:
-                                    logger.info(f"  🎯 Multi-Level TP: {levels['tp_prices']}, SL: {levels['sl']}")
+                                    logger.info(f"  🎯 TP: {levels['tp_prices']}, SL: {levels['sl']}")
                                     self.set_tpsl_for_position(symbol, "short", levels["tp_prices"], levels["sl"], order_size)
                                 else:
                                     # Fallback auf spread-basiert
@@ -791,11 +1039,15 @@ class SpreadScalper:
                                 self.positions[symbol].update({
                                     "side": "short", "entry": price, "size": order_size,
                                     "mark_price": depth["mid"],
+                                    "tp_prices": levels["tp_prices"] if levels and levels.get("tp_prices") else [tp, tp, tp],
+                                    "sl": levels["sl"] if levels and levels.get("sl") else sl,
                                 })
                             else:
                                 self.positions[symbol] = {
                                     "side": "short", "entry": price, "size": order_size,
                                     "mark_price": depth["mid"],
+                                    "tp_prices": levels["tp_prices"] if levels and levels.get("tp_prices") else [tp, tp, tp],
+                                    "sl": levels["sl"] if levels and levels.get("sl") else sl,
                                 }
                             if buy_id:
                                 client._post("/api/v2/mix/order/cancel-order", {
@@ -804,23 +1056,21 @@ class SpreadScalper:
                                 })
                             continue
                     
-                    # Kein Fill → cancel beide
-                    if buy_id:
-                        client._post("/api/v2/mix/order/cancel-order", {
-                            "symbol": symbol, "productType": "USDT-FUTURES",
-                            "marginCoin": "USDT", "orderId": buy_id
-                        })
-                    if sell_id:
-                        client._post("/api/v2/mix/order/cancel-order", {
-                            "symbol": symbol, "productType": "USDT-FUTURES",
-                            "marginCoin": "USDT", "orderId": sell_id
-                        })
+                    # Kein Fill → Order bleibt als pending, Stale-Timeout (60s) cancelled später
+                    logger.debug(f"  ⏳ {symbol}: Order nicht gefuellt — warte auf Stale-Timeout")
                 
             except Exception as e:
                 logger.error(f"❌ {symbol} Error: {e}")
     
     def run(self):
         """Main Loop"""
+        # ── Startup: Alte TPSL-Orders aller Symbole löschen (inkl. pos_loss/profit) ──
+        for sym in SYMBOLS:
+            try:
+                client.cancel_tpsl_orders(sym, extra_types=['pos_loss', 'pos_profit'])
+            except:
+                pass
+        
         cycle = 0
         while self.running:
             try:
@@ -828,6 +1078,20 @@ class SpreadScalper:
                 start = time.time()
                 
                 self.run_cycle()
+                # Positions-State für Dashboard in JSON schreiben
+                try:
+                    state = {}
+                    for sym, pdata in self.positions.items():
+                        if pdata.get("tp_prices"):
+                            state[sym] = {
+                                "sl": pdata.get("sl"),
+                                "tp": pdata.get("tp_prices", [None])[0],
+                            }
+                    if state:
+                        with open(SHARED_STATE_PATH, "w") as f:
+                            json.dump(state, f)
+                except:
+                    pass
                 
                 # Alle 15 Zyklen (~30s) Prüfe TP/SL auf offenen Positionen und closed positions
                 if cycle % 15 == 0:
@@ -846,41 +1110,71 @@ class SpreadScalper:
                 time.sleep(LOOP_INTERVAL)
     
     def _verify_tpsl_on_positions(self):
-        """Prüfe alle offenen Positionen auf korrekte TP/SL (Spread-Scalping Logik)"""
+        """Prüfe alle offenen Positionen auf korrektes bot-seitiges SL/TP-Tracking:
+        - Prüft ob self.positions für jede Position SL/TP gespeichert hat
+        - Wenn nicht (z.B. nach Bot-Neustart), berechne neu und speichere
+        - Läuft alle ~30s (alle 15 Zyklen)
+        """
         for symbol in SYMBOLS:
             try:
-                pos = self.get_position(symbol)
-                if not pos:
+                pos_raw = client.get_position(symbol)
+                if not pos_raw or float(pos_raw.get("total", 0)) == 0:
                     continue
-                
-                entry_price = float(pos.get("openPriceAvg", 0))
-                depth = self.get_depth(symbol)
-                if not depth or not entry_price:
+
+                stored = self.positions.get(symbol, {})
+                has_sl = stored.get("sl") is not None
+                has_tp = stored.get("tp_prices") is not None
+
+                if has_sl and has_tp:
+                    continue  # Alles OK
+
+                logger.info(f"🔧 Bot-SL fehlt für {symbol}: SL={has_sl} TP={has_tp} — berechne neu")
+
+                side = pos_raw.get("holdSide", "short")
+                entry = float(pos_raw.get("openPriceAvg", 0))
+                if not entry:
                     continue
-                
-                spread = depth["spread"]
-                price_place = PRICE_PLACES.get(symbol, 2)
-                
-                # Berechne korrektes TP/SL fuer Spread-Scalping
-                mark_price = float(pos.get("markPrice", entry_price))
-                
-                if pos["side"] == "long":
-                    # LONG: TP muss > MarkPrice (nicht > Entry!)
-                    # SL muss < Entry
-                    correct_tp = round(mark_price + spread, price_place)
-                    correct_sl = round(min(entry_price - spread * 0.5, mark_price * 0.985), price_place)
+
+                atr = self.calc_atr(symbol)
+                if atr:
+                    levels = self.calc_tp_sl_levels(symbol, entry, side, atr)
                 else:
-                    # SHORT: TP muss < MarkPrice
-                    # SL muss > Entry
-                    correct_tp = round(mark_price - spread, price_place)
-                    correct_sl = round(max(entry_price + spread * 0.5, mark_price * 1.015), price_place)
-                
-                # Prüfe ob TPSL bereits gesetzt wurde — sonst neu setzen
-                stored_tps = self.positions.get(symbol, {}).get("tp_prices")
-                if stored_tps is None:
-                    logger.info(f"🔄 {symbol}: TP/SL fehlt, setze neu (Entry={entry_price:.2f}, Spread={spread:.4f})")
-                    self.set_tpsl_for_position(symbol, pos["side"], [correct_tp, correct_tp, correct_tp], correct_sl, pos["size"])
-                    
+                    levels = None
+
+                if levels:
+                    tp_prices = levels["tp_prices"]
+                    sl_price = levels["sl"]
+                else:
+                    # Fallback: 1.5% vom Marktpreis
+                    mark = float(pos_raw.get("markPrice", entry))
+                    price_places = PRICE_PLACES.get(symbol, 2)
+                    if side == "short":
+                        sl_price = round(mark * 1.015, price_places)
+                        tp_price = round(mark * 0.985, price_places)
+                    else:
+                        sl_price = round(mark * 0.985, price_places)
+                        tp_price = round(mark * 1.015, price_places)
+                    tp_prices = [tp_price, tp_price, tp_price]
+
+                # Best-Effort: Exchange-TPSL versuchen (funktioniert auf Live, Demo ignoriert)
+                try:
+                    self.set_tpsl_for_position(symbol, side, tp_prices, sl_price, float(pos_raw["total"]))
+                except:
+                    pass
+
+                # Bot-seitig tracken (funktioniert auf Live UND Demo)
+                if symbol not in self.positions:
+                    self.positions[symbol] = {}
+                self.positions[symbol].update({
+                    "tp_prices": tp_prices,
+                    "sl": sl_price,
+                    "side": side,
+                    "entry": entry,
+                    "size": float(pos_raw["total"]),
+                    "mark_price": float(pos_raw.get("markPrice", entry)),
+                })
+                logger.info(f"  ✅ {symbol}: Bot-SL={sl_price} TP={tp_prices[0]} gespeichert")
+
             except Exception as e:
                 logger.debug(f"  ⏭️  {symbol} verify: {e}")
     
