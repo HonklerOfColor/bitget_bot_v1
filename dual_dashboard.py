@@ -20,18 +20,23 @@ V1_VENV = V1_DIR / ".venv" / "bin" / "python3"
 V2_VENV = V2_DIR / ".venv" / "bin" / "python3"
 REFRESH = 5  # Sekunden
 
-
 def fetch_bot(bot_dir, venv_python):
-    result = subprocess.run(
-        [str(venv_python), str(FETCH_SCRIPT), str(bot_dir)],
-        capture_output=True, text=True, timeout=30,
-    )
-    if result.returncode != 0:
-        return [], f"Fehler: {result.stderr.strip()}"
+    """Ruft Positionen per Subprocess ab (isolierte Imports). Timeout 10s."""
     try:
-        return json.loads(result.stdout), None
-    except json.JSONDecodeError as e:
-        return [], f"JSON-Fehler: {e}"
+        result = subprocess.run(
+            [str(venv_python), str(FETCH_SCRIPT), str(bot_dir)],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode != 0:
+            return [], f"Fehler: {result.stderr.strip()}"
+        try:
+            return json.loads(result.stdout), None
+        except json.JSONDecodeError as e:
+            return [], f"JSON-Fehler: {e}"
+    except subprocess.TimeoutExpired:
+        return [], f"Timeout (>10s)"
+    except FileNotFoundError:
+        return [], f"Python nicht gefunden: {venv_python}"
 
 
 def fmt(v, decimals=2):
@@ -95,12 +100,20 @@ def render():
 
 
 def run_live():
-    signal.signal(signal.SIGINT, lambda s, f: sys.exit(0))
-    while True:
-        print("\033c", end="")          # clear screen (ESC c)
-        out = render()
-        print(out, flush=True)
-        time.sleep(REFRESH)
+    try:
+        signal.signal(signal.SIGINT, lambda s, f: sys.exit(0))
+        while True:
+            print("\033c", end="")
+            try:
+                out = render()
+                print(out, flush=True)
+            except Exception as e:
+                print(f"\n  ⚠️ Render-Fehler: {e}")
+                print(f"  Nächster Versuch in {REFRESH}s...")
+            time.sleep(REFRESH)
+    except (KeyboardInterrupt, SystemExit):
+        print("\n👋 Dashboard beendet.")
+        sys.exit(0)
 
 
 def main():
