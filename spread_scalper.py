@@ -22,8 +22,8 @@ OFFSET_PCT = 0.0001        # 0.01% Offset (hauchduenn, um im Orderbook zu bleibe
 MAX_SPREAD_PCT = 0.005     # Max 0.5% Spread (sonst zu volatil)
 TELEGRAM_ON = True
 
-# 🧭 Hedge Mode — SHORT-Only (Backtest: Short 13× profitabler als Long)
-SHORT_ONLY = True      # True = SHORT-Only (Backtest-Ranking Platz 3)
+# 🧭 Beide Richtungen (Funding-Signal gesteuert)
+SHORT_ONLY = False      # False = LONG+SHORT via Funding-Signal
 EMAFILTER = False       # Trendfilter: True = nur in EMA-Richtung traden
 
 # 🧠 Trade Analysis — DeepSeek nach jedem Trade

@@ -14,7 +14,7 @@ Hebel 3×, Loop alle 2s, 4 Symbole parallel.
 |-----------|------|-------------|
 | **Symbole** | BTCUSDT, ETHUSDT, SOLUSDT | 3 Pairs parallel (XRP entfernt) |
 | **Hebel** | **3×** | Aus Backtest optimiert (5× verliert 10× mehr) |
-| **Richtung** | **SHORT-Only** (`SHORT_ONLY=True`) | Nur Short-Trades, kein LONG |
+| **Richtung** | **LONG+SHORT** (`SHORT_ONLY=False`) | Funding-Signal: >+0.01%→SHORT, <−0.01%→LONG |
 | **EMA-Filter** | **Aus** (`EMAFILTER=False`) | Deaktiviert |
 | **Loop** | ~2 Sekunden | Pro Symbol sequentiell |
 | **Order-Typ** | Post-Only Limit | Immer Maker (Fee-Rabatt) |
@@ -54,7 +54,11 @@ Size wird dynamisch erhöht wenn `min_qty × mid_price < $5`.
    - Funding Rate + OI-Change
    - Wenn Funding > 0.05% → **skip** (zu crowded long)
    - Wenn kein Signal (None) → **skip**
-7. **Richtung**: `SHORT_ONLY=True` → immer **SHORT** (Funding-Signal-Logik ist im Code, aber durch SHORT_ONLY deaktiviert)
+7. **Richtung**: `SHORT_ONLY=False` → Richtung per **Funding-Signal**:
+   - Funding > +0.01% → **SHORT** (Crowd long, Contrarian)
+   - Funding < −0.01% → **LONG** (Crowd short, Contrarian)
+   - Funding neutral + EMA-Filter an → EMA-Trend
+   - Funding neutral + kein EMA-Filter → **skip** (kein Trade)
 8. **Post-Only Limit-Order platzieren**
 9. **0.5s warten**, dann Order-Status prüfen
 10. **Gefüllt** → TP/SL via `place-pos-tpsl` + bot-seitiges Tracking
@@ -152,7 +156,7 @@ Alle 15 Minuten via `no_agent=True` Script:
 
 ## ⚠️ Bekannte Limitationen
 
-- **SHORT-Only**: Keine LONG-Trades, auch bei günstigem Funding
+- **Funding neutral + kein EMA-Filter**: Kein Trade bei neutralem Funding — der Bot skipped
 - **Demo `place-pos-tpsl`**: Bitget Demo akzeptiert den Call (code 00000) aber persistiert nicht
 - **Single TP**: Nur TP1 auf Exchange gesetzt (Multi-Level-TP deaktiviert)
 - **TPSL-Orders nicht lesbar**: `orders-plan`/`current-plan` geben 40404 → nur via Position-Felder
@@ -165,4 +169,5 @@ Alle 15 Minuten via `no_agent=True` Script:
 
 | Datum | Änderung |
 |-------|----------|
+| 17.07.2026 | **LONG+SHORT** (SHORT_ONLY=False), Funding-Signal-Steuerung |
 | 17.07.2026 | TP 3.0→**2.0×ATR**, XRPUSDT entfernt |
