@@ -15,7 +15,7 @@ sys.path.insert(0, "/Users/andreas/bitget_bot_v1")
 import bitget_client as client
 
 # ── Config ───────────────────────────────────────────────────────────────────
-SYMBOLS = ["SOLUSDT", "BTCUSDT", "ETHUSDT", "XRPUSDT"]
+SYMBOLS = ["SOLUSDT", "BTCUSDT", "ETHUSDT"]
 LOOP_INTERVAL = 2          # Alle 2 Sekunden
 LEVERAGE = 3  # 3× Hebel (Backtest: V10 1× verliert 10× weniger als 5×)
 OFFSET_PCT = 0.0001        # 0.01% Offset (hauchduenn, um im Orderbook zu bleiben)
@@ -39,12 +39,11 @@ MIN_SIZES = {
     "BTCUSDT": 0.001,   # min_qty=0.001 → ~$63 (groesser als 5 USDT min)
     "ETHUSDT": 0.05,    # min_qty erhöht auf 0.05 (war 0.01, zu klein) → ~$150
     "SOLUSDT": 0.2,     # min_qty erhöht auf 0.2 (war 0.1) → ~$16
-    "XRPUSDT": 5,       # min_qty=1, 5×$1.10=$5.50 > $5 min, volumePlace=0 (integer)
 }
 
-# 📊 Single-Level TP: 100% bei 3×ATR (Backtest: TP 3× = höchster PF 0.64)
+# 📊 Single-Level TP: 100% bei 2×ATR (bessere TP-Trefferquote als 3×)
 TP_LEVELS = [
-    {"pct": 1.0, "atr_mult": 3.0, "label": "TP1"},   # 100% @ 3.0× ATR
+    {"pct": 1.0, "atr_mult": 2.0, "label": "TP1"},   # 100% @ 2.0× ATR
 ]
 SL_BASE_MULT = 0.30     # 0.30× ATR baseline
 SL_MAX_MULT = 0.60      # 0.60× ATR bei Verlustserie (proportional zu SL_BASE)
@@ -56,14 +55,10 @@ PRICE_PLACES = {
     "SOLUSDT": 3,
     "BTCUSDT": 1,
     "ETHUSDT": 1,
-    "XRPUSDT": 4,       # pricePlace=4
 }
 
 # 🎯 Spread-Penetration pro Symbol (0.0 = Bid, 1.0 = Ask)
-# Default: SHORT=0.7, LONG=0.3. XRP braucht aggressivere Einstiege bei 1-Tick-Spread.
-SPREAD_PEN_SHORT = {
-    "XRPUSDT": 0.25,    # SHORT bei 25% → 1.0963 (Bid+1) statt 1.0964 (Ask)
-}
+SPREAD_PEN_SHORT = {}    # Keine Overrides nötig
 SPREAD_PEN_LONG = {}    # Keine Overrides nötig (LONG via Hedge, SHORT_ONLY)
 
 # 📡 Coinglass-style Sentiment Signals (via Bitget API — kein externer API-Key nötig)

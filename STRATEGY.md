@@ -12,7 +12,7 @@ Hebel 3×, Loop alle 2s, 4 Symbole parallel.
 
 | Parameter | Wert | Beschreibung |
 |-----------|------|-------------|
-| **Symbole** | BTCUSDT, ETHUSDT, SOLUSDT, XRPUSDT | 4 Pairs parallel |
+| **Symbole** | BTCUSDT, ETHUSDT, SOLUSDT | 3 Pairs parallel (XRP entfernt) |
 | **Hebel** | **3×** | Aus Backtest optimiert (5× verliert 10× mehr) |
 | **Richtung** | **SHORT-Only** (`SHORT_ONLY=True`) | Nur Short-Trades, kein LONG |
 | **EMA-Filter** | **Aus** (`EMAFILTER=False`) | Deaktiviert |
@@ -26,14 +26,8 @@ Hebel 3×, Loop alle 2s, 4 Symbole parallel.
 
 ---
 
-## 📐 Spread-Penetration (Entry-Preise)
-
-| Symbol | SHORT Penetration | Beschreibung |
-|--------|:-:|-------------|
-| SOLUSDT | 70% | SHORT @ Bid + (Spread × 0.7) |
-| BTCUSDT | 70% | SHORT @ Bid + (Spread × 0.7) |
-| ETHUSDT | 70% | SHORT @ Bid + (Spread × 0.7) |
-| **XRPUSDT** | **25%** | **Aggressiver** wegen 1-Tick-Spread |
+**Spread-Penetration (Entry-Preise):**
+Alle Symbole: SHORT @ 70% (Bid + Spread × 0.7)
 
 ---
 
@@ -44,7 +38,6 @@ Hebel 3×, Loop alle 2s, 4 Symbole parallel.
 | BTCUSDT | 0.001 | ~$64 |
 | ETHUSDT | 0.05 | ~$150 |
 | SOLUSDT | 0.2 | ~$16 |
-| XRPUSDT | 5.0 | ~$5.50 |
 
 Size wird dynamisch erhöht wenn `min_qty × mid_price < $5`.
 
@@ -71,13 +64,13 @@ Size wird dynamisch erhöht wenn `min_qty × mid_price < $5`.
 
 ## 🎯 TP/SL — Exchange + Bot-Seitig (Dual Protection)
 
-### TP: Single-Level bei 3.0× ATR
+### TP: Single-Level bei 2.0× ATR
 
 ```python
-TP_LEVELS = [{"pct": 1.0, "atr_mult": 3.0}]  # 100% @ 3.0× ATR
+TP_LEVELS = [{"pct": 1.0, "atr_mult": 2.0}]  # 100% @ 2.0× ATR
 ```
 
-- SHORT: `TP = Entry - (ATR × 3.0)`
+- SHORT: `TP = Entry - (ATR × 2.0)`
 - Wird via `place-pos-tpsl` auf der Exchange gesetzt (position-level)
 
 ### SL: Chart-basiert + ATR-Fallback
@@ -96,7 +89,7 @@ Sobald eine Position **≥3% Peak-ROE** erreicht:
 4. **Check alle 2s**, Update auf Exchange via `place-pos-tpsl`
 
 **Beispiel SHORT @77.995, ATR=0.319:**
-- TP = 77.995 − (0.319 × 3.0) = **77.038**
+- TP = 77.995 − (0.319 × 2.0) = **77.357**
 - SL initial = höchstes High (20h) + 0.1% = **78.411**
 - Bei Peak 3.8%: SL = **78.277** (lockt 1.8% Gewinn)
 - Bei Peak 3.9%: SL = **78.262** (lockt 1.9% Gewinn)
@@ -165,3 +158,11 @@ Alle 15 Minuten via `no_agent=True` Script:
 - **TPSL-Orders nicht lesbar**: `orders-plan`/`current-plan` geben 40404 → nur via Position-Felder
 - **Telegram-Token nicht gesetzt**: `scalper_config.py` fehlt → Telegram-Benachrichtigungen inaktiv
 - **0.4% Guard**: Sehr kleine SL-Anpassungen werden vom Trailing übersprungen
+
+---
+
+## Änderungshistorie
+
+| Datum | Änderung |
+|-------|----------|
+| 17.07.2026 | TP 3.0→**2.0×ATR**, XRPUSDT entfernt |
