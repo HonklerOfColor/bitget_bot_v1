@@ -12,7 +12,7 @@ Hebel 3×, Loop alle 2s, 4 Symbole parallel.
 
 | Parameter | Wert | Beschreibung |
 |-----------|------|-------------|
-| **Symbole** | BTCUSDT, ETHUSDT, SOLUSDT | 3 Pairs parallel (XRP entfernt) |
+| **Symbole** | BTCUSDT, ETHUSDT, SOLUSDT, BNBUSDT | 4 Pairs parallel (XRP entfernt) |
 | **Hebel** | **3×** | Aus Backtest optimiert (5× verliert 10× mehr) |
 | **Richtung** | **LONG+SHORT** (`SHORT_ONLY=False`) | Funding-Signal: >+0.01%→SHORT, <−0.01%→LONG |
 | **EMA-Filter** | **Aus** (`EMAFILTER=False`) | Deaktiviert |
@@ -38,6 +38,7 @@ Alle Symbole: SHORT @ 70% (Bid + Spread × 0.7)
 | BTCUSDT | 0.001 | ~$64 |
 | ETHUSDT | 0.05 | ~$150 |
 | SOLUSDT | 0.2 | ~$16 |
+| BNBUSDT | 0.05 | ~$14 |
 
 Size wird dynamisch erhöht wenn `min_qty × mid_price < $5`.
 
@@ -169,5 +170,6 @@ Alle 15 Minuten via `no_agent=True` Script:
 
 | Datum | Änderung |
 |-------|----------|
+| 18.07.2026 | **BNBUSDT** hinzugefügt (4 Symbole) |
 | 17.07.2026 | **LONG+SHORT** (SHORT_ONLY=False), Funding-Signal-Steuerung |
 | 17.07.2026 | TP 3.0→**2.0×ATR**, XRPUSDT entfernt |

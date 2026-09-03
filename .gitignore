@@ -19,3 +19,4 @@ lib/
 # Backtest data (generated, can be recreated)
 backtest/*.json
 backtest/*.png
+*.zip

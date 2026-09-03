@@ -16,19 +16,21 @@ sys.path.insert(0, '.')
 import bitget_client
 
 # ── Exakte Bot-Parameter ──
-SYMBOLS = ["SOLUSDT", "BTCUSDT", "ETHUSDT", "XRPUSDT"]
-LEVERAGE = 5
+SYMBOLS = ["SOLUSDT", "BTCUSDT", "ETHUSDT", "BNBUSDT"]
+LEVERAGE = 3
 MAKER_FEE = 0.0002
 TAKER_FEE = 0.0006
 BREAKEVEN_PNL_PCT = 0.03
 
-MIN_SIZES = {"BTCUSDT": 0.001, "ETHUSDT": 0.05, "SOLUSDT": 0.2, "XRPUSDT": 5}
-PRICE_PLACES = {"SOLUSDT": 3, "BTCUSDT": 1, "ETHUSDT": 1, "XRPUSDT": 4}
+MIN_SIZES = {"BTCUSDT": 0.001, "ETHUSDT": 0.05, "SOLUSDT": 0.2, "BNBUSDT": 0.05}
+PRICE_PLACES = {"SOLUSDT": 3, "BTCUSDT": 1, "ETHUSDT": 1, "BNBUSDT": 2}
 
+# Aktuelle Bot-Parameter (18.07.2026):
+# TP: Single-Level bei 2.0× ATR, SL: chart-basiert oder 1.5× ATR
+# ROE-Trailing ab 3% Peak, 2% unter Peak
+# Offset 0.12%, Max Spread 1.0%
 TP_LEVELS = [
-    {"pct": 0.15, "atr_mult": 3.0, "label": "TP1"},
-    {"pct": 0.35, "atr_mult": 6.0, "label": "TP2"},
-    {"pct": 0.50, "atr_mult": 9.0, "label": "TP3"},
+    {"pct": 1.0, "atr_mult": 2.0, "label": "TP1"},   # 100% @ 2.0× ATR
 ]
 
 
@@ -86,11 +88,11 @@ def run_backtest(symbol, candles, short_only=True, force_long=False):
             else:
                 sl_price = round(entry - atr * 1.5, PRICE_PLACES.get(symbol, 2))
 
-            # TP1 = 3× ATR vom Entry
+            # TP1 = 2× ATR vom Entry (Single-Level, 100% Size)
             if side == "short":
-                tp1 = round(entry - atr * 3.0, PRICE_PLACES.get(symbol, 2))
+                tp1 = round(entry - atr * 2.0, PRICE_PLACES.get(symbol, 2))
             else:
-                tp1 = round(entry + atr * 3.0, PRICE_PLACES.get(symbol, 2))
+                tp1 = round(entry + atr * 2.0, PRICE_PLACES.get(symbol, 2))
 
             entry_fee = notional * MAKER_FEE
             margin = (size * entry) / LEVERAGE
@@ -156,7 +158,7 @@ def run_backtest(symbol, candles, short_only=True, force_long=False):
                 exit_price = sl
                 reason = "SL"
 
-            # ── TP-Check (Multi-Level: TP1@3×ATR) ──
+            # ── TP-Check (Single-Level: TP1@2×ATR) ──
             tp1 = position["tp1"]
             if not hit_sl:
                 if side == "short" and l <= tp1:

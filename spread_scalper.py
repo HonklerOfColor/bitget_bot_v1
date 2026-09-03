@@ -10,21 +10,27 @@ Strategie: Spread-Penetration on Bitget Futures
 import sys, os, time, json, threading
 from datetime import datetime
 from loguru import logger
+from dotenv import load_dotenv
+
+# .env laden (/opt/data/.env)
+load_dotenv("/opt/data/.env")
 
 sys.path.insert(0, "/Users/andreas/bitget_bot_v1")
 import bitget_client as client
 
 # ── Config ───────────────────────────────────────────────────────────────────
-SYMBOLS = ["SOLUSDT", "BTCUSDT", "ETHUSDT"]
+SYMBOLS = ["BTCUSDT", "ETHUSDT", "BNBUSDT"]  # SOLUSDT entfernt (Learning: −1.97 USDT über 66 Trades, schwächstes Symbol)
 LOOP_INTERVAL = 2          # Alle 2 Sekunden
 LEVERAGE = 3  # 3× Hebel (Backtest: V10 1× verliert 10× weniger als 5×)
-OFFSET_PCT = 0.0001        # 0.01% Offset (hauchduenn, um im Orderbook zu bleiben)
-MAX_SPREAD_PCT = 0.005     # Max 0.5% Spread (sonst zu volatil)
+OFFSET_PCT = 0.0012        # 0.12% Offset (vorher 0.01% — zu aggressiv)
+MAX_SPREAD_PCT = 0.010      # Max 1.0% Spread (vorher 0.5% — zu eng, viele Skips)
 TELEGRAM_ON = True
 
-# 🧭 Beide Richtungen (Funding-Signal gesteuert)
-SHORT_ONLY = False      # False = LONG+SHORT via Funding-Signal
-EMAFILTER = False       # Trendfilter: True = nur in EMA-Richtung traden
+# 🧭 Richtung per Momentum (2 1H-Kerzen)
+# LONG bei 2 bullish, SHORT bei 2 bearish, sonst kein Trade
+SHORT_ONLY = False
+LONG_ONLY = True         # Learning 26.08.: SHORTs −231 USDT über 1577 Trades → NUR LONG
+EMAFILTER = True        # Trendfilter: True = nur in EMA-Richtung traden (Learning: Shorts ohne Trend verlieren)
 
 # 🧠 Trade Analysis — DeepSeek nach jedem Trade
 ANALYSIS_ENABLED = True   # False = deaktivieren (keine API-Kosten)
@@ -32,22 +38,23 @@ ANALYSIS_ENABLED = True   # False = deaktivieren (keine API-Kosten)
 # ── Shared State (Dashboard-Kommunikation) ──
 SHARED_STATE_PATH = os.path.join(os.path.dirname(__file__), "bot_state.json")
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
-DEEPSEEK_MODEL = "deepseek-chat"      # DeepSeek-V3 (Flash), wechseln auf "deepseek-reasoner" für DeepSeek-R1/Pro
+DEEPSEEK_MODEL = "deepseek-reasoner"      # DeepSeek-R1 (Reasoning) für bessere Trade-Analysen
 
 # Symbol-spezifische Mindestmengen (updatet fuer 5 USDT Minimum UND Bitget Min-Qty Limits)
 MIN_SIZES = {
     "BTCUSDT": 0.001,   # min_qty=0.001 → ~$63 (groesser als 5 USDT min)
-    "ETHUSDT": 0.05,    # min_qty erhöht auf 0.05 (war 0.01, zu klein) → ~$150
+    "ETHUSDT": 0.01,    # min_qty reduziert auf 0.01 (~$19) — vorher 0.05, Balance reichte nicht
     "SOLUSDT": 0.2,     # min_qty erhöht auf 0.2 (war 0.1) → ~$16
+    "BNBUSDT": 0.05,    # min_qty=0.01 → ~$14 (mind. 0.05 für $5 Notional)
 }
 
-# 📊 Single-Level TP: 100% bei 2×ATR (bessere TP-Trefferquote als 3×)
+# 📊 Single-Level TP: 100% bei 2.5×ATR (Learning 26.08.: BTC LONG >2h = 71% WR +45.78 — Gewinner laufen lassen!)
 TP_LEVELS = [
-    {"pct": 1.0, "atr_mult": 2.0, "label": "TP1"},   # 100% @ 2.0× ATR
+    {"pct": 1.0, "atr_mult": 2.5, "label": "TP1"},   # 100% @ 2.5× ATR (vorher 1.6 — zu früh gestoppt)
 ]
 SL_BASE_MULT = 0.30     # 0.30× ATR baseline
 SL_MAX_MULT = 0.60      # 0.60× ATR bei Verlustserie (proportional zu SL_BASE)
-BREAKEVEN_PNL_PCT = 0.03  # +3% unrealized → move SL to entry
+BREAKEVEN_PNL_PCT = 0.03  # +3% unrealized → Trailing aktiv (konsistent mit V2/V3, weniger Whipsaw-Stops)
 LOSS_STREAK_THRESHOLD = 3  # Nach 3 Verlusten: scale SL bis 0.60×
 
 # Preis-Rundung (Stellen nach Komma)
@@ -55,22 +62,47 @@ PRICE_PLACES = {
     "SOLUSDT": 3,
     "BTCUSDT": 1,
     "ETHUSDT": 1,
+    "BNBUSDT": 2,
 }
 
 # 🎯 Spread-Penetration pro Symbol (0.0 = Bid, 1.0 = Ask)
-SPREAD_PEN_SHORT = {}    # Keine Overrides nötig
-SPREAD_PEN_LONG = {}    # Keine Overrides nötig (LONG via Hedge, SHORT_ONLY)
+SPREAD_PEN_SHORT = {
+    "ETHUSDT": 1.0,    # 100% = Ask (fuer Post-Only, sonst rejected)
+    "SOLUSDT": 1.0,    # 100% = Ask
+    "BTCUSDT": 1.0,    # 100% = Ask
+    "BNBUSDT": 1.0,    # 100% = Ask
+}
+SPREAD_PEN_LONG = {
+    "ETHUSDT": 0.0,    # 0% = Bid (fuer Post-Only)
+    "SOLUSDT": 0.0,    # 0% = Bid
+    "BTCUSDT": 0.0,    # 0% = Bid
+    "BNBUSDT": 0.0,    # 0% = Bid
+}
 
 # 📡 Coinglass-style Sentiment Signals (via Bitget API — kein externer API-Key nötig)
 MAX_FUNDING_RATE = 0.0005     # 0.05% — SHORT nur wenn Funding darunter (sonst extreme crowded long)
 OI_MIN_CHANGE_PCT = -10       # Min OI-Change % im Ticker (Filter für Illiquidität)
-# 📊 Richtungssignal — Funding Rate Schwelle
-FUNDING_SIGNAL_THRESHOLD = 0.0001  # 0.01% — Funding > +0.01% → SHORT, < -0.01% → LONG
+# 📊 Richtungssignal — Funding Rate Schwelle (gelockert für mehr Trades)
+FUNDING_SIGNAL_THRESHOLD = 0.00002  # 0.002% — SHORT bei Funding > 0.002%, LONG bei < -0.002%
 
-# Logger
+# 🚦 Order-Rate-Limit: Max 3 Orders pro Minute pro Symbol
+MAX_ORDERS_PER_MINUTE = 3
+ORDER_COOLDOWN_SECONDS = 20  # Mindestabstand zwischen Orders (60s / 3 = 20s)
+
+# 📊 Spread-Threshold (deaktiviert — Market-Maker haben oft sehr enge Spreads)
+MIN_SPREAD_PCT = 0.0  # Kein Minimum — Spread-Filter nur nach oben (MAX_SPREAD_PCT)
+
+# Logger mit Rotation (max 10MB)
 logger.remove()
-logger.add(sys.stderr, level="INFO", format="<green>{time:HH:mm:ss}</green> | {message}")
-logger.add("spread_scalper.log", level="INFO", format="{time:YYYY-MM-DD HH:mm:ss} | {message}")
+logger.add(sys.stderr, level="DEBUG", format="<green>{time:HH:mm:ss}</green> | {message}")
+logger.add(
+    "spread_scalper.log",
+    level="DEBUG",  # DEBUG für detaillierte Logs (Spread, Rate-Limit, Funding)
+    format="{time:YYYY-MM-DD HH:mm:ss} | {message}",
+    rotation="10 MB",  # Rotiere nach 10MB
+    retention=1,       # Behalte nur 1 alte Log-Datei (int, nicht string!)
+    compression="zip", # Komprimiere alte Logs
+)
 
 
 class SpreadScalper:
@@ -87,6 +119,8 @@ class SpreadScalper:
         self.pending_orders = {}  # symbol -> {"buy_id": "...", "sell_id": "...", "ts": timestamp}
         self.last_pnl_check = {}  # symbol -> timestamp (10s-TP1-Cooldown)
         self.peak_roe = {}        # symbol -> höchster ROE% (für Trailing Stop)
+        self.order_timestamps = {}  # symbol -> [list of order timestamps in last minute]
+        self.last_order_time = {}   # symbol -> last order timestamp (for cooldown)
         
         # 🧠 Trade Learner
         self.trade_log = []  # Abgeschlossene Trades
@@ -108,7 +142,11 @@ class SpreadScalper:
         self._check_existing_tpsl()
     
     def _check_existing_tpsl(self):
-        """Setze TP/SL fuer bestehende Positionen ohne — nutze ATR-basiertes Single TP"""
+        """Setze TP/SL fuer bestehende Positionen ohne — nutze ATR-basiertes Single TP
+        
+        Wichtig: Bestehende TP/SL auf der Exchange NIEMALS überschreiben!
+        Der Bot setzt nur TP/SL wenn auf der Exchange noch KEINE gesetzt sind.
+        """
         for symbol in SYMBOLS:
             try:
                 pos_raw = client.get_position(symbol)  # Volle raw API-Response
@@ -116,39 +154,73 @@ class SpreadScalper:
                     continue
                 has_tp = bool(pos_raw.get("takeProfit", ""))
                 has_sl = bool(pos_raw.get("stopLoss", ""))
-                if not has_tp or not has_sl:
-                    logger.info(f"🔧 Startup-Check für {symbol}: TP={has_tp}, SL={has_sl}")
-                    
-                    # Berechne ATR für TP/SL Levels
-                    atr = self.calc_atr(symbol)
-                    if not atr:
-                        logger.warning(f"  ⏭️  ATR nicht verfügbar für {symbol}, skip")
-                        continue
-                    
+                
+                # ⬇️ FIX: Bestehende TP/SL NIEMALS überschreiben!
+                if has_tp and has_sl:
+                    # TP/SL existieren bereits auf Exchange — nur bot-seitig tracken
                     entry_price = float(pos_raw.get("openPriceAvg", pos_raw.get("markPrice", 0)))
                     side = pos_raw["holdSide"]
+                    existing_tp = float(pos_raw["takeProfit"])
+                    existing_sl = float(pos_raw["stopLoss"])
                     
-                    # Berechne Single TP/SL
-                    levels = self.calc_tp_sl_levels(symbol, entry_price, side, atr)
-                    if not levels:
-                        continue
-                    
-                    logger.info(f"  📍 {side.upper()}: Entry={entry_price}, ATR={atr:.4f}")
-                    logger.info(f"     TP={levels['tp_prices'][0]}, SL={levels['sl']}")
-                    
-                    self.set_tpsl_for_position(symbol, side, levels["tp_prices"], levels["sl"], float(pos_raw["total"]))
-                    
-                    # ⬇️ Bot-seitiges SL/TP-Tracking (Demo-fähig)
                     if symbol not in self.positions:
                         self.positions[symbol] = {}
                     self.positions[symbol].update({
-                        "tp_prices": levels["tp_prices"],
-                        "sl": levels["sl"],
+                        "tp_prices": [existing_tp],
+                        "sl": existing_sl,
                         "side": side,
                         "entry": entry_price,
                         "size": float(pos_raw["total"]),
                         "mark_price": float(pos_raw.get("markPrice", entry_price)),
                     })
+                    # 🆕 FIX: peak_roe sofort aus aktuellem ROE initialisieren,
+                    # damit profitable Bestandspositionen direkt auf Trailing-Stand stehen
+                    try:
+                        pnl = float(pos_raw.get("unrealizedPL", 0))
+                        margin = float(pos_raw.get("marginSize", 0))
+                        if margin > 0:
+                            current_roe = pnl / margin * 100
+                            if current_roe > 0:
+                                self.peak_roe[symbol] = current_roe
+                                logger.info(f"  🔒 {symbol}: peak_roe init {current_roe:.1f}% (Bestandsposition im Profit)")
+                    except Exception as e:
+                        logger.debug(f"  peak_roe init {symbol}: {e}")
+                    logger.debug(f"  ✅ {symbol}: Bestehende TP/SL übernommen (TP={existing_tp}, SL={existing_sl})")
+                    continue
+                
+                # Nur hier neu setzen, wenn KEINE TP/SL existieren
+                logger.info(f"🔧 Startup-Check für {symbol}: TP={has_tp}, SL={has_sl} — setze neu")
+                
+                # Berechne ATR für TP/SL Levels
+                atr = self.calc_atr(symbol)
+                if not atr:
+                    logger.warning(f"  ⏭️  ATR nicht verfügbar für {symbol}, skip")
+                    continue
+                
+                entry_price = float(pos_raw.get("openPriceAvg", pos_raw.get("markPrice", 0)))
+                side = pos_raw["holdSide"]
+                
+                # Berechne Single TP/SL
+                levels = self.calc_tp_sl_levels(symbol, entry_price, side, atr)
+                if not levels:
+                    continue
+                
+                logger.info(f"  📍 {side.upper()}: Entry={entry_price}, ATR={atr:.4f}")
+                logger.info(f"     TP={levels['tp_prices'][0]}, SL={levels['sl']}")
+                
+                self.set_tpsl_for_position(symbol, side, levels["tp_prices"], levels["sl"], float(pos_raw["total"]))
+                
+                # ⬇️ Bot-seitiges SL/TP-Tracking (Demo-fähig)
+                if symbol not in self.positions:
+                    self.positions[symbol] = {}
+                self.positions[symbol].update({
+                    "tp_prices": levels["tp_prices"],
+                    "sl": levels["sl"],
+                    "side": side,
+                    "entry": entry_price,
+                    "size": float(pos_raw["total"]),
+                    "mark_price": float(pos_raw.get("markPrice", entry_price)),
+                })
             except Exception as e:
                 logger.error(f"  ❌ {symbol}: {type(e).__name__}: {e}")
     
@@ -230,17 +302,17 @@ class SpreadScalper:
             if side == "short":
                 highest = max(highs)
                 sl = round(highest * 1.001, price_places)  # 0.1% über Hoch
-                # Sicherheit: SL nicht näher als 0.5× ATR
+                # Sicherheit: SL nicht näher als 0.8× ATR (Learning: enge Short-SLs = Whipsaw-Verluste)
                 atr = self.calc_atr(symbol)
-                if atr and sl < entry_price + atr * 0.5:
-                    sl = round(entry_price + atr * 0.5, price_places)
+                if atr and sl < entry_price + atr * 0.8:
+                    sl = round(entry_price + atr * 0.8, price_places)
                 return sl
             else:  # long
                 lowest = min(lows)
                 sl = round(lowest * 0.999, price_places)  # 0.1% unter Tief
                 atr = self.calc_atr(symbol)
-                if atr and sl > entry_price - atr * 0.5:
-                    sl = round(entry_price - atr * 0.5, price_places)
+                if atr and sl > entry_price - atr * 0.8:
+                    sl = round(entry_price - atr * 0.8, price_places)
                 return sl
         except Exception as e:
             logger.debug(f"  ⏭️ Chart-SL ({symbol}): {e}")
@@ -464,44 +536,66 @@ Answer in GERMAN, max 2 sentences:
             return None
 
     def _decide_direction(self, symbol, cg, depth):
-        """Entscheide LONG oder SHORT basierend auf Funding Rate + EMA.
-        
-        Signal-Logik:
-        - Funding stark positiv (> +0.01%): Crowd ist long → SHORT (Contrarian)
-        - Funding stark negativ (< -0.01%): Crowd ist short → LONG (Contrarian)
-        - Funding neutral: EMA-Trendfilter (wenn aktiv) oder neutral → skip
-        - SHORT_ONLY=True: immer SHORT (wie bisher)
-        
-        Returns: \"long\", \"short\", oder None (kein Trade)
+        """Entscheide LONG oder SHORT basierend auf Reversal-Pattern (1H Kerzen).
+
+        - SHORT wenn letzte Kerze bearisch UND vorletzte bullisch (Rejection)
+        - LONG wenn letzte Kerze bullisch UND vorletzte bearisch (Pullback)
+        - Sonst: kein Trade — verhindert Chasing (nicht in fallende Kurse rein-shorten)
+        - SHORT_ONLY=True: immer SHORT
+        - LONG_ONLY=True: immer LONG (Learning: SHORTs −231 USDT über 1577 Trades!)
         """
+        if LONG_ONLY:
+            # Nur LONG: Reversal-Pattern, aber nur long_signal
+            try:
+                klines = client.get_candles(symbol, "1H", limit=3)
+                if not klines or len(klines) < 3:
+                    return None
+                c1 = klines[-2]
+                c2 = klines[-1]
+                o1 = float(c1[1]); c1_close = float(c1[4])
+                o2 = float(c2[1]); c2_close = float(c2[4])
+                long_signal = c1_close < o1 and c2_close > o2
+                if long_signal:
+                    logger.debug(f"  📈 Reversal: bear → bull → LONG ({symbol})")
+                    return "long"
+                return None
+            except Exception as e:
+                logger.debug(f"  ⏭️  LONG_ONLY-Momentum ({symbol}): {e}")
+                return None
+
         if SHORT_ONLY:
             return "short"
 
-        fr = cg["funding_rate"]
-        
-        # 📡 Starkes Funding-Signal
-        if fr > FUNDING_SIGNAL_THRESHOLD:
-            logger.debug(f"  📡 Funding {cg['funding_pct']:+.4f}% → SHORT (Crowd long)")
-            return "short"
-        elif fr < -FUNDING_SIGNAL_THRESHOLD:
-            logger.debug(f"  📡 Funding {cg['funding_pct']:+.4f}% → LONG (Crowd short)")
-            return "long"
-        
-        # 📡 Neutrales Funding → EMA-Trendfilter
-        if EMAFILTER:
-            ema = self._calc_ema(symbol)
-            if ema is not None:
-                mid = depth["mid"]
-                if mid > ema:
-                    logger.debug(f"  📡 Preis ${mid:.2f} > EMA ${ema:.2f} → LONG")
-                    return "long"
-                else:
-                    logger.debug(f"  📡 Preis ${mid:.2f} < EMA ${ema:.2f} → SHORT")
-                    return "short"
-        
-        # Kein klares Signal → skip
-        logger.debug(f"  ⏭️  Funding neutral, kein EMA-Filter — kein Trade")
-        return None
+        # Reversal-Pattern aus den letzten 2 1H-Kerzen
+        try:
+            klines = client.get_candles(symbol, "1H", limit=3)
+            if not klines or len(klines) < 3:
+                logger.debug(f"  ⏭️  Keine Momentum-Daten für {symbol}")
+                return None
+            
+            c1 = klines[-2]  # vorletzte Kerze
+            c2 = klines[-1]  # letzte Kerze
+            
+            o1 = float(c1[1]); c1_close = float(c1[4])
+            o2 = float(c2[1]); c2_close = float(c2[4])
+            
+            # Reversal: vorletzte bullisch → letzte bearisch = short (Rejection am Hoch)
+            short_signal = c1_close > o1 and c2_close < o2
+            # Reversal: vorletzte bearisch → letzte bullisch = long (Bounce vom Tief)
+            long_signal = c1_close < o1 and c2_close > o2
+            
+            if short_signal:
+                logger.debug(f"  📉 Reversal: bull → bear → SHORT ({symbol})")
+                return "short"
+            elif long_signal:
+                logger.debug(f"  📈 Reversal: bear → bull → LONG ({symbol})")
+                return "long"
+            else:
+                logger.debug(f"  ⏭️  Kein klares Reversal → kein Trade ({symbol})")
+                return None
+        except Exception as e:
+            logger.debug(f"  ⏭️  Reversal-Fehler ({symbol}): {e}")
+            return None
 
     def get_position(self, symbol):
         """Aktuelle Position abrufen"""
@@ -528,6 +622,31 @@ Answer in GERMAN, max 2 sentences:
     
     def place_limit_order(self, symbol, side, price, size):
         """Platziere Limit-Order (Post-Only = Maker)"""
+        # ⚙️ Vor jeder Order: Hebel setzen (falls Exchange-Einstellung abweicht)
+        try:
+            hold_side = "long" if side == "long" else "short"
+            client._post("/api/v2/mix/account/set-leverage", {
+                "symbol": symbol, "productType": "USDT-FUTURES",
+                "marginCoin": "USDT", "leverage": str(LEVERAGE),
+                "holdSide": hold_side,
+            })
+        except:
+            pass
+        
+        # 💰 Balance-Check: Genug Margin frei?
+        try:
+            bal_data = client._get("/api/v2/mix/account/accounts", {"productType": "USDT-FUTURES"})
+            accts = bal_data.get("data") or []
+            if accts:
+                avail = float(accts[0].get("available", 0))
+                notional_check = float(price) * float(size)
+                margin_needed = notional_check / LEVERAGE
+                if avail < margin_needed * 0.8:  # 20% Puffer
+                    logger.warning(f"  ⏭️  {symbol} {side}: Nicht genug Margin (${avail:.2f} frei, ${margin_needed:.2f} nötig)")
+                    return None
+        except:
+            pass
+        
         notional = float(price) * float(size)
         if notional < 4.95:
             logger.warning(f"  ⚠️  {symbol} {side}: size={size} @ ${price} = ${notional:.2f} < $5 — SKIPPE Order")
@@ -876,8 +995,33 @@ Answer in GERMAN, max 2 sentences:
                         continue
                     
                     spread_pct = depth["spread"] / depth["mid"]
+                    # Spread-Threshold: Orders nur wenn Spread breit genug (MIN_SPREAD_PCT)
+                    if spread_pct < MIN_SPREAD_PCT:
+                        logger.debug(f"⏭️  {symbol}: Spread zu eng ({spread_pct*100:.3f}% < {MIN_SPREAD_PCT*100:.2f}%)")
+                        continue
                     if spread_pct > MAX_SPREAD_PCT:
                         logger.debug(f"⏭️  {symbol}: Spread zu gross ({spread_pct*100:.3f}%)")
+                        continue
+                    
+                    # 🚦 Order-Rate-Limit: Max 3 Orders pro Minute prüfen
+                    now = time.time()
+                    if symbol not in self.order_timestamps:
+                        self.order_timestamps[symbol] = []
+                    # Alte Timestamps entfernen (>60s)
+                    self.order_timestamps[symbol] = [ts for ts in self.order_timestamps[symbol] if now - ts < 60]
+                    
+                    # Prüfen ob Max erreicht
+                    if len(self.order_timestamps[symbol]) >= MAX_ORDERS_PER_MINUTE:
+                        oldest = min(self.order_timestamps[symbol])
+                        wait_time = 60 - (now - oldest)
+                        logger.debug(f"⏳ {symbol}: Rate-Limit erreicht ({len(self.order_timestamps[symbol])}/min) — warte {wait_time:.0f}s")
+                        continue
+                    
+                    # Cooldown prüfen (mindestens 20s zwischen Orders)
+                    last_order = self.last_order_time.get(symbol, 0)
+                    if now - last_order < ORDER_COOLDOWN_SECONDS:
+                        wait_time = ORDER_COOLDOWN_SECONDS - (now - last_order)
+                        logger.debug(f"⏳ {symbol}: Cooldown aktiv — warte {wait_time:.0f}s")
                         continue
                     
                     # ❗ Prüfe ob schon eine Order schwebt — keine neue platzieren!
@@ -931,6 +1075,13 @@ Answer in GERMAN, max 2 sentences:
                         logger.debug(f"  ⏭️ {symbol}: Keine Coinglass-Signale — überspringe")
                         continue
 
+                    # 🕐 Handelsfenster-Sperre: Verluststunden 2-4/14/17/20/22 Uhr
+                    # (Simulation über 1577 Trades: diese Stunden = −323 USDT, 10-13 Uhr war GUT!)
+                    _h = time.localtime().tm_hour
+                    if _h in (2, 3, 4, 14, 17, 20, 22):
+                        logger.info(f"  ⏭️ {symbol}: Handelsfenster gesperrt ({_h}:00, Verluststunde) — kein neuer Trade")
+                        continue
+
                     # 📡 Richtung per Funding-Signal entscheiden
                     direction = self._decide_direction(symbol, cg, depth)
                     if direction is None:
@@ -958,6 +1109,10 @@ Answer in GERMAN, max 2 sentences:
                     
                     if buy_id or sell_id:
                         self.pending_orders[symbol] = {"buy_id": buy_id, "sell_id": sell_id, "ts": time.time()}
+                    
+                    # Order-Timestamp für Rate-Limit tracken (auch bei Fehlern — sonst Spam)
+                    self.order_timestamps.setdefault(symbol, []).append(time.time())
+                    self.last_order_time[symbol] = time.time()
                     
                     # Warte kurz und prüfe welche gefüllt wurde
                     time.sleep(0.5)
@@ -1059,10 +1214,32 @@ Answer in GERMAN, max 2 sentences:
     
     def run(self):
         """Main Loop"""
-        # ── Startup: Alte TPSL-Orders aller Symbole löschen (inkl. pos_loss/profit) ──
+        # ── Startup: Hebel setzen + TPSL-Orders aufräumen ──
+        # Hebel für ALLE Symbole setzen (LONG + SHORT), auch wenn Position offen ist
+        for sym in SYMBOLS:
+            for side in ('long', 'short'):
+                try:
+                    client._post("/api/v2/mix/account/set-leverage", {
+                        "symbol": sym, "productType": "USDT-FUTURES",
+                        "marginCoin": "USDT", "leverage": str(LEVERAGE),
+                        "holdSide": side,
+                    })
+                    logger.debug(f"  ⚙️ {sym} {side}: Hebel {LEVERAGE}x gesetzt")
+                except Exception as e:
+                    logger.warning(f"  ⚠️ {sym} {side}: Hebel {LEVERAGE}x fehlgeschlagen ({e})")
+        # _check_existing_tpsl() wurde bereits in __init__ aufgerufen,
+        # aber wir müssen sicherstellen dass bestehende TP/SL NICHT gecancelt werden.
+        # Lösche NUR TPSL-Orders für Symbole OHNE offene Position
         for sym in SYMBOLS:
             try:
-                client.cancel_tpsl_orders(sym, extra_types=['pos_loss', 'pos_profit'])
+                pos = client.get_position(sym)
+                if not pos or float(pos.get("total", 0)) == 0:
+                    # Keine Position → TPSL sicher löschen
+                    client.cancel_tpsl_orders(sym, extra_types=['pos_loss', 'pos_profit'])
+                    logger.debug(f"  🧹 {sym}: Keine Position, TPSL gelöscht")
+                else:
+                    # Bestehende Position → TPSL NIEMALS löschen!
+                    logger.debug(f"  🔒 {sym}: Position vorhanden, TPSL erhalten")
             except:
                 pass
         
