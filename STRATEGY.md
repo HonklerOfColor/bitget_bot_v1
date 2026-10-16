@@ -1,6 +1,11 @@
-# DS-SpreadScalper — Aktuelle Strategie (Code-Stand 12.07.2026)
+# DS-SpreadScalper — Aktuelle Strategie
 
-## Überblick
+> **Gültige Handelsregeln (16.10.2026):** [TRADING_RULES.md](TRADING_RULES.md).
+> Long-only seit 2026-08-26, keine neuen Entries in Europe/Vienna 0–4 / 14 / 17 / 20 / 22,
+> 24h-Time-Stop bei ROE ≤ 0, 12h-Break-Even-SL, Hebel **3×** (nicht 5×).
+> Der Rest dieser Datei ist der Strategie-Stand vom 12.07.2026 und in Richtung, Symbolen und Filtern überholt.
+
+## Überblick (historisch, 12.07.2026)
 
 **High-Frequency Spread-Scalping Bot** auf Bitget USDT-M Futures (Live, $128 Equity).
 Post-Only Limit-Orders innerhalb des Bid-Ask Spreads. **SHORT-Only** (Backtest: Short 13× profitabler als Long).  
@@ -8,7 +13,7 @@ Hebel 3×, Loop alle 2s, 4 Symbole parallel.
 
 ---
 
-## 🔧 Kern-Parameter
+## 🔧 Kern-Parameter (historisch, 12.07.2026)
 
 | Parameter | Wert | Beschreibung |
 |-----------|------|-------------|
@@ -170,6 +175,7 @@ Alle 15 Minuten via `no_agent=True` Script:
 
 | Datum | Änderung |
 |-------|----------|
+| 16.10.2026 | Regeln in `TRADING_RULES.md` festgeschrieben: Long-only, Wien-Handelsfenster, 24h-Time-Stop, 12h-BE, Hebel bleibt 3× |
 | 18.07.2026 | **BNBUSDT** hinzugefügt (4 Symbole) |
 | 17.07.2026 | **LONG+SHORT** (SHORT_ONLY=False), Funding-Signal-Steuerung |
 | 17.07.2026 | TP 3.0→**2.0×ATR**, XRPUSDT entfernt |

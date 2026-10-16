@@ -17,11 +17,15 @@ load_dotenv("/opt/data/.env")
 
 sys.path.insert(0, "/Users/andreas/bitget_bot_v1")
 import bitget_client as client
+_HERE = os.path.dirname(os.path.abspath(__file__))
+if _HERE not in sys.path:
+    sys.path.append(_HERE)
+from trading_rules import entry_hour_blocked, should_arm_breakeven, time_stop_due, vienna_hour
 
 # ── Config ───────────────────────────────────────────────────────────────────
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "BNBUSDT"]  # SOLUSDT entfernt (Learning: −1.97 USDT über 66 Trades, schwächstes Symbol)
 LOOP_INTERVAL = 2          # Alle 2 Sekunden
-LEVERAGE = 3  # 3× Hebel (Backtest: V10 1× verliert 10× weniger als 5×)
+LEVERAGE = 3  # Live-Regel seit 2026-07-13: 3×, nicht 5× (Backtest: 5× verliert deutlich mehr)
 OFFSET_PCT = 0.0012        # 0.12% Offset (vorher 0.01% — zu aggressiv)
 MAX_SPREAD_PCT = 0.010      # Max 1.0% Spread (vorher 0.5% — zu eng, viele Skips)
 TELEGRAM_ON = True
@@ -133,7 +137,12 @@ class SpreadScalper:
         logger.info(f"   Symbole: {SYMBOLS}")
         logger.info(f"   Intervall: {LOOP_INTERVAL}s | Hebel: {LEVERAGE}x")
         logger.info(f"   Offset: {OFFSET_PCT*100:.3f}%")
-        mode = "SHORT-Only" if SHORT_ONLY else "LONG+SHORT (Funding-Signal)"
+        if LONG_ONLY:
+            mode = "LONG-Only"
+        elif SHORT_ONLY:
+            mode = "SHORT-Only"
+        else:
+            mode = "LONG+SHORT (Funding-Signal)"
         logger.info(f"   Modus: {mode} | EMA-Filter: {EMAFILTER}")
         self.print_stats()
         logger.info("=" * 50)
@@ -609,6 +618,9 @@ Answer in GERMAN, max 2 sentences:
                     "pnl": float(pos.get("unrealizedPL", 0)),
                     "markPrice": float(pos.get("markPrice", 0)),
                     "created_ms": int(pos.get("cTime") or 0),
+                    # 12h-BE vergleicht gegen den Exchange-SL. Ohne dieses Feld
+                    # sieht der Fallback keinen engeren SL und kann ihn auf Entry weiten.
+                    "stopLoss": pos.get("stopLoss"),
                 }
         except:
             pass
@@ -623,6 +635,10 @@ Answer in GERMAN, max 2 sentences:
     
     def place_limit_order(self, symbol, side, price, size):
         """Platziere Limit-Order (Post-Only = Maker)"""
+        # Order-Grenze: LONG_ONLY darf nicht nur in der Signal-Funktion stehen.
+        if LONG_ONLY and side != "long":
+            logger.warning(f"  ⛔ {symbol}: LONG-Only — {side}-Order blockiert")
+            return "SKIP_LONG_ONLY"
         # ⚙️ Vor jeder Order: Hebel setzen (falls Exchange-Einstellung abweicht)
         try:
             hold_side = "long" if side == "long" else "short"
@@ -855,6 +871,38 @@ Answer in GERMAN, max 2 sentences:
             pass
         return "unknown", 0
     
+    def _enforce_time_stop(self, symbol, pos):
+        """24h-Time-Stop für Verlierer. True, wenn die Position geschlossen wurde.
+
+        Läuft vor Orderbuch und TP-Tracking. Bleibt tp_prices leer (ATR/Depth down),
+        hat der alte Pfad den Stop per `continue` ausgelassen.
+        """
+        try:
+            created_ms = float(pos.get("created_ms") or 0)
+            if created_ms <= 0:
+                return False
+            age_h = (time.time() * 1000 - created_ms) / 3600000
+            pnl = float(pos.get("pnl") or 0)
+            size = float(pos.get("size") or 0)
+            mark = float(pos.get("markPrice") or 0)
+            if not time_stop_due(age_h, pnl, size, mark, LEVERAGE):
+                return False
+            logger.info(
+                f"⏰ {symbol} Time-Stop: {age_h:.1f}h alt, PnL {pnl:.4f} ≤ 0 — schließe {pos['side']}"
+            )
+            # Erst schließen, dann loggen. Ein fehlgeschlagener Close wird im nächsten
+            # Zyklus erneut versucht, ohne den Trade doppelt zu verbuchen.
+            if not self.place_market_close(symbol, pos["side"], pos["size"]):
+                logger.warning(f"  ⏰ {symbol}: Time-Stop-Close fehlgeschlagen — nächster Zyklus")
+                return False
+            self.record_trade(symbol, pos["side"], pos["entry"], mark, pnl, "Time-Stop (>24h)")
+            self.positions.pop(symbol, None)
+            self.peak_roe.pop(symbol, None)
+            return True
+        except Exception as e:
+            logger.debug(f"  ⏰ {symbol}: Time-Stop-Check: {e}")
+            return False
+
     def run_cycle(self):
         """Haupt-Loop alle 2 Sekunden"""
         for symbol in SYMBOLS:
@@ -863,6 +911,10 @@ Answer in GERMAN, max 2 sentences:
                 
                 if pos:
                     # ── Position existiert → warte auf TP oder schliesse ──
+                    # Time-Stop vor Orderbuch/TP: sonst bleibt ein Verlierer >24h offen,
+                    # wenn Depth oder ATR ausfällt (tp_prices bleibt None → continue).
+                    if self._enforce_time_stop(symbol, pos):
+                        continue
                     depth = self.get_depth(symbol)
                     if not depth:
                         continue
@@ -930,27 +982,6 @@ Answer in GERMAN, max 2 sentences:
                             self.positions.pop(symbol, None)
                             self.peak_roe.pop(symbol, None)
                     
-                    # ── ⏰ Time-Stop (Learning 14.09.): >24h gehalten + ROE ≤ 0 → zwangsschließen ──
-                    # (Analyse 27.08.–14.09.: >8h-Positionen = Hauptverluste bei V1/V2;
-                    #  Simulation „Time-Stop 24h": −2.51 → +1.70 USDT ohne Crash-Fenster)
-                    try:
-                        created_ms = pos.get("created_ms") or 0
-                        if created_ms > 0:
-                            age_h = (time.time() * 1000 - created_ms) / 3600000
-                            if age_h >= 24:
-                                _margin = float(pos["size"]) * float(pos.get("markPrice", 0)) / LEVERAGE
-                                _roe = (float(pos.get("pnl", 0)) / _margin * 100) if _margin > 0 else 0
-                                if _roe <= 0:
-                                    _mp = float(pos.get("markPrice", 0))
-                                    logger.info(f"⏰ {symbol} Time-Stop: {age_h:.1f}h alt, ROE {_roe:.1f}% ≤ 0 — schließe {pos['side']}")
-                                    self.record_trade(symbol, pos["side"], pos["entry"], _mp, float(pos.get("pnl", 0)), "Time-Stop (>24h)")
-                                    self.place_market_close(symbol, pos["side"], pos["size"])
-                                    self.positions.pop(symbol, None)
-                                    self.peak_roe.pop(symbol, None)
-                                    continue
-                    except Exception as e:
-                        logger.debug(f"  ⏰ {symbol}: Time-Stop-Check: {e}")
-                    
                     # ── Dynamischer SL (alle 10s nachgeführt) ──
                     # ROE-basiertes Trailing: SL 2% unter Peak-ROE.
                     # Läuft bei jeder offenen Position kontinuierlich mit.
@@ -975,34 +1006,34 @@ Answer in GERMAN, max 2 sentences:
                                     self.peak_roe[symbol] = roe_pct
 
                                 # ── 🛡️ 12h-Break-Even-SL (MC-Finding 14.09.) ──
-                                # >12h offen + im Plus + Trailing (<3% Peak) noch inaktiv
+                                # ≥12h offen + ROE ≥ 0.3% + Trailing (<3% Peak) noch inaktiv
                                 # → SL auf Entry — Schutz vor späten Retracements
                                 # (hist. größter Einzelposten: 33–97h-Holds).
-                                if (self.peak_roe.get(symbol, 0) < (BREAKEVEN_PNL_PCT * 100)
-                                        and roe_pct >= 0.3):
+                                _cms = float(pos.get("created_ms") or 0)
+                                _age_h = (time.time() * 1000 - _cms) / 3600000 if _cms > 0 else 0
+                                if should_arm_breakeven(
+                                    _age_h, roe_pct, self.peak_roe.get(symbol, 0), BREAKEVEN_PNL_PCT,
+                                ):
                                     try:
-                                        _cms = float(pos.get("created_ms") or 0)
-                                        _age_h = (time.time() * 1000 - _cms) / 3600000 if _cms > 0 else 0
-                                        if _age_h >= 12:
-                                            be_sl = round(entry_price, PRICE_PLACES.get(symbol, 2))
-                                            _cur = current_sl
-                                            if _cur is None:
-                                                try:
-                                                    _slr = pos.get("stopLoss")
-                                                    if _slr not in (None, "", "0"):
-                                                        _cur = float(_slr)
-                                                except Exception:
-                                                    _cur = None
-                                            _improves = (_cur is None
-                                                         or (side == "long" and _cur < be_sl)
-                                                         or (side == "short" and _cur > be_sl))
-                                            _safe = ((side == "long" and be_sl < mark * 0.9985)
-                                                     or (side == "short" and be_sl > mark * 1.0015))
-                                            if _improves and _safe:
-                                                self.positions.setdefault(symbol, {})["sl"] = be_sl
-                                                self.set_tpsl_for_position(symbol, side, tp_prices, be_sl, pos_size)
-                                                logger.info(f"🛡️ {symbol} {side.upper()}: 12h-BE-SL → {be_sl} (Entry | ROE {roe_pct:+.2f}% | {_age_h:.1f}h)")
-                                                self._notify_sl_move(symbol, side.upper(), roe_pct, be_sl)
+                                        be_sl = round(entry_price, PRICE_PLACES.get(symbol, 2))
+                                        _cur = current_sl
+                                        if _cur is None:
+                                            try:
+                                                _slr = pos.get("stopLoss")
+                                                if _slr not in (None, "", "0"):
+                                                    _cur = float(_slr)
+                                            except Exception:
+                                                _cur = None
+                                        _improves = (_cur is None
+                                                     or (side == "long" and _cur < be_sl)
+                                                     or (side == "short" and _cur > be_sl))
+                                        _safe = ((side == "long" and be_sl < mark * 0.9985)
+                                                 or (side == "short" and be_sl > mark * 1.0015))
+                                        if _improves and _safe:
+                                            self.positions.setdefault(symbol, {})["sl"] = be_sl
+                                            self.set_tpsl_for_position(symbol, side, tp_prices, be_sl, pos_size)
+                                            logger.info(f"🛡️ {symbol} {side.upper()}: 12h-BE-SL → {be_sl} (Entry | ROE {roe_pct:+.2f}% | {_age_h:.1f}h)")
+                                            self._notify_sl_move(symbol, side.upper(), roe_pct, be_sl)
                                     except Exception as be_e:
                                         logger.debug(f"  🛡️ BE-SL {symbol}: {be_e}")
 
@@ -1129,12 +1160,12 @@ Answer in GERMAN, max 2 sentences:
                         logger.debug(f"  ⏭️ {symbol}: Keine Coinglass-Signale — überspringe")
                         continue
 
-                    # 🕐 Handelsfenster-Sperre: Verluststunden 0-4/14/17/20/22 Uhr
-                    # (Runde 4: 2-4/14/17/20/22 aus 1577 Trades; 14.09.: 0+1 Uhr ergänzt —
-                    #  Nachtstunden 0-2 = −4.2 USDT bei 19 Trades in 2.5 Wochen)
-                    _h = time.localtime().tm_hour
-                    if _h in (0, 1, 2, 3, 4, 14, 17, 20, 22):
-                        logger.info(f"  ⏭️ {symbol}: Handelsfenster gesperrt ({_h}:00, Verluststunde) — kein neuer Trade")
+                    # 🕐 Handelsfenster-Sperre: Verluststunden Europe/Vienna
+                    # 0–4, 14, 17, 20, 22. Nicht die Prozess-Zeitzone — ein UTC-Host würde
+                    # die Stunden um CET/CEST verschieben.
+                    if entry_hour_blocked():
+                        _h = vienna_hour()
+                        logger.info(f"  ⏭️ {symbol}: Handelsfenster gesperrt ({_h}:00 Europe/Vienna, Verluststunde) — kein neuer Trade")
                         continue
 
                     # 📡 Richtung per Funding-Signal entscheiden
@@ -1153,6 +1184,11 @@ Answer in GERMAN, max 2 sentences:
                         sell_id = None
                         logger.info(f"  📈 {symbol}: LONG Order | 📡 Funding {cg['funding_pct']:+.4f}% | OI {cg['oi_usd']/1e6:.0f}M$")
                     else:
+                        # LONG_ONLY ist die Live-Regel seit 2026-08-26. _decide_direction
+                        # liefert dann kein "short"; das hier ist die Order-Grenze.
+                        if LONG_ONLY:
+                            logger.warning(f"  ⛔ {symbol}: LONG-Only — Short-Entry blockiert")
+                            continue
                         # 📡 Funding Rate Check für SHORT: nicht shorten wenn zu positiv (crowded longs)
                         if cg["funding_rate"] > MAX_FUNDING_RATE:
                             logger.info(f"  ⏭️ {symbol}: Funding {cg['funding_pct']:.4f}% > {MAX_FUNDING_RATE*100:.2f}% — zu bullish, kein Short")
@@ -1163,9 +1199,9 @@ Answer in GERMAN, max 2 sentences:
                         logger.info(f"  📉 {symbol}: SHORT Order | 📡 Funding {cg['funding_pct']:+.4f}% | OI {cg['oi_usd']/1e6:.0f}M$")
                     
                     # SKIP_* (Margin/Notional) = KEIN Order-Versuch → buy_id/sell_id neutralisieren
-                    if buy_id in ("SKIP_MARGIN", "SKIP_NOTIONAL"):
+                    if buy_id in ("SKIP_MARGIN", "SKIP_NOTIONAL", "SKIP_LONG_ONLY"):
                         buy_id = None
-                    if sell_id in ("SKIP_MARGIN", "SKIP_NOTIONAL"):
+                    if sell_id in ("SKIP_MARGIN", "SKIP_NOTIONAL", "SKIP_LONG_ONLY"):
                         sell_id = None
 
                     if not buy_id and not sell_id:
