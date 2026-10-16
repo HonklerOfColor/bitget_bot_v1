@@ -974,6 +974,38 @@ Answer in GERMAN, max 2 sentences:
                                 if roe_pct > self.peak_roe.get(symbol, -9999):
                                     self.peak_roe[symbol] = roe_pct
 
+                                # ── 🛡️ 12h-Break-Even-SL (MC-Finding 14.09.) ──
+                                # >12h offen + im Plus + Trailing (<3% Peak) noch inaktiv
+                                # → SL auf Entry — Schutz vor späten Retracements
+                                # (hist. größter Einzelposten: 33–97h-Holds).
+                                if (self.peak_roe.get(symbol, 0) < (BREAKEVEN_PNL_PCT * 100)
+                                        and roe_pct >= 0.3):
+                                    try:
+                                        _cms = float(pos.get("created_ms") or 0)
+                                        _age_h = (time.time() * 1000 - _cms) / 3600000 if _cms > 0 else 0
+                                        if _age_h >= 12:
+                                            be_sl = round(entry_price, PRICE_PLACES.get(symbol, 2))
+                                            _cur = current_sl
+                                            if _cur is None:
+                                                try:
+                                                    _slr = pos.get("stopLoss")
+                                                    if _slr not in (None, "", "0"):
+                                                        _cur = float(_slr)
+                                                except Exception:
+                                                    _cur = None
+                                            _improves = (_cur is None
+                                                         or (side == "long" and _cur < be_sl)
+                                                         or (side == "short" and _cur > be_sl))
+                                            _safe = ((side == "long" and be_sl < mark * 0.9985)
+                                                     or (side == "short" and be_sl > mark * 1.0015))
+                                            if _improves and _safe:
+                                                self.positions.setdefault(symbol, {})["sl"] = be_sl
+                                                self.set_tpsl_for_position(symbol, side, tp_prices, be_sl, pos_size)
+                                                logger.info(f"🛡️ {symbol} {side.upper()}: 12h-BE-SL → {be_sl} (Entry | ROE {roe_pct:+.2f}% | {_age_h:.1f}h)")
+                                                self._notify_sl_move(symbol, side.upper(), roe_pct, be_sl)
+                                    except Exception as be_e:
+                                        logger.debug(f"  🛡️ BE-SL {symbol}: {be_e}")
+
                                 # ROE-Trailing: aktiv ab 3% Peak-ROE
                                 # SL immer auf Break-Even (Entry) sobald 3% erreicht,
                                 # danach 2% unter dem höchsten erreichten ROE nachführen
