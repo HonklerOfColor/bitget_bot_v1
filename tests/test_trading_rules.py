@@ -11,6 +11,7 @@ sys.path.insert(0, str(ROOT))
 from trading_rules import (
     BLOCKED_ENTRY_HOURS,
     VIENNA,
+    entries_are_paused,
     entry_hour_blocked,
     should_arm_breakeven,
     should_time_stop,
@@ -69,7 +70,45 @@ class BreakevenTests(unittest.TestCase):
         self.assertFalse(should_arm_breakeven(20, 1.0, 3.0))
 
 
-class SourceWiringTests(unittest.TestCase):
+class EntriesPausedTests(unittest.TestCase):
+    def test_only_explicit_false_resumes(self):
+        self.assertTrue(entries_are_paused(None))
+        self.assertTrue(entries_are_paused(object()))
+
+        class Missing:
+            pass
+
+        class Paused:
+            ENTRIES_PAUSED = True
+
+        class Other:
+            ENTRIES_PAUSED = None
+
+        class Live:
+            ENTRIES_PAUSED = False
+
+        self.assertTrue(entries_are_paused(Missing()))
+        self.assertTrue(entries_are_paused(Paused()))
+        self.assertTrue(entries_are_paused(Other()))
+        self.assertFalse(entries_are_paused(Live()))
+
+    def test_pause_blocks_new_entries_but_not_open_positions(self):
+        src = (ROOT / "spread_scalper.py").read_text()
+        start = src.index("def run_cycle")
+        end = src.index("def _entries_paused")
+        cycle = src[start:end]
+        pos = cycle.index("if pos:")
+        flat = cycle.index("else:", pos)
+        self.assertLess(cycle.index("_enforce_time_stop"), flat)
+        self.assertLess(flat, cycle.index("self._entries_paused()"))
+        self.assertLess(cycle.index("self._entries_paused()"), cycle.index("place_limit_order"))
+        order = src[src.index("def place_limit_order"):src.index("def place_market_close")]
+        self.assertIn("SKIP_ENTRIES_PAUSED", order)
+        self.assertLess(order.index("_entries_paused"), order.index("place-order"))
+        run = src[src.index("def run(self)"):]
+        self.assertIn("_notify_entries_paused", run)
+        self.assertIn("3600", run)
+        self.assertIn("Hebel-Setup übersprungen", run)
     def test_cycle_enforces_stop_before_orderbook_and_uses_vienna(self):
         src = (ROOT / "spread_scalper.py").read_text()
         start = src.index("def run_cycle")

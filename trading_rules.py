@@ -29,6 +29,17 @@ def entry_hour_blocked(epoch_s=None):
     return vienna_hour(epoch_s) in BLOCKED_ENTRY_HOURS
 
 
+def entries_are_paused(cfg):
+    """Neue Entries nur, wenn config ENTRIES_PAUSED ausdrücklich False ist.
+
+    Fehlendes Attribut, True, None oder jede andere Wahrheit pausieren.
+    So bleibt ein altes config.py ohne die Zeile auf der sicheren Seite.
+    """
+    if cfg is None or not hasattr(cfg, "ENTRIES_PAUSED"):
+        return True
+    return getattr(cfg, "ENTRIES_PAUSED") is not False
+
+
 def is_bearish(open_, close):
     return close < open_
 

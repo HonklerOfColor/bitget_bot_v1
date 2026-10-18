@@ -1,9 +1,13 @@
 # TRADING RULES — DS-SpreadScalper (V1)
 
-Stand 16.10.2026. Durchgesetzt in `spread_scalper.py` (`trading_rules.py` für die reinen Entscheidungen).
-Geprüft gegen die geschlossenen Trades von Subaccount `at-HNKHNKHNK` (587 Trades, 18.07.–15.10.2026).
+Stand 18.10.2026. Durchgesetzt in `spread_scalper.py` (`trading_rules.py` für die reinen Entscheidungen).
+Geprüft gegen die geschlossenen Trades von Subaccount `at-HNKHNKHNK`.
 
-Diese Datei ist die gültige Regelliste. `STRATEGY.md` beschreibt den älteren Strategie-Stand und verweist hierher.
+**Neue Entries sind pausiert** (18.10.2026). Default, solange `config.py` nicht ausdrücklich `ENTRIES_PAUSED = False` setzt. Der Loop bleibt an, loggt die Pause stündlich und schickt einmal Telegram. Offene Positionen werden weiter verwaltet.
+
+## 0. Pause
+
+24-Monats-Backtest der Long-Regeln: Netto −302 USDT, kein OOS-robuster Edge (vier von fünf Sechsmonatsfenstern negativ). Monte-Carlo auf den Live-Trades: P(Gewinn) 1,8 %, seit 14.09. 9,7 %, Ruin-Risiko 29–37 % in 500 Trades. Deshalb keine neuen Orders. Details: [backtest/V1_EDGE_STUDY.md](backtest/V1_EDGE_STUDY.md).
 
 ## 1. Nur Long — seit 2026-08-26
 

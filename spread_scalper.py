@@ -21,7 +21,8 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.append(_HERE)
 from trading_rules import (
-    entry_hour_blocked, is_reversal_long, should_arm_breakeven, time_stop_due, vienna_hour,
+    entries_are_paused, entry_hour_blocked, is_reversal_long,
+    should_arm_breakeven, time_stop_due, vienna_hour,
 )
 
 # ── Config ───────────────────────────────────────────────────────────────────
@@ -636,7 +637,10 @@ Answer in GERMAN, max 2 sentences:
             pass
     
     def place_limit_order(self, symbol, side, price, size):
-        """Platziere Limit-Order (Post-Only = Maker)"""
+        """Platziere Limit-Order (Post-Only = Maker). Nur für Entries."""
+        if self._entries_paused():
+            logger.warning(f"  ⏸️  {symbol} {side}: Entries pausiert — kein Orderversand")
+            return "SKIP_ENTRIES_PAUSED"
         # Order-Grenze: LONG_ONLY darf nicht nur in der Signal-Funktion stehen.
         if LONG_ONLY and side != "long":
             logger.warning(f"  ⛔ {symbol}: LONG-Only — {side}-Order blockiert")
@@ -1077,6 +1081,10 @@ Answer in GERMAN, max 2 sentences:
                                 logger.debug(f"  ⚠️ Dynamischer SL {symbol}: {sl_e}")
                     
                 else:
+                    # Keine Position → neuer Entry. Pausiert: nichts an den Markt legen.
+                    # Offene Positionen laufen im Zweig darüber weiter (SL/TP, Time-Stop, BE).
+                    if self._entries_paused():
+                        continue
                     depth = self.get_depth(symbol)
                     if not depth:
                         continue
@@ -1201,9 +1209,9 @@ Answer in GERMAN, max 2 sentences:
                         logger.info(f"  📉 {symbol}: SHORT Order | 📡 Funding {cg['funding_pct']:+.4f}% | OI {cg['oi_usd']/1e6:.0f}M$")
                     
                     # SKIP_* (Margin/Notional) = KEIN Order-Versuch → buy_id/sell_id neutralisieren
-                    if buy_id in ("SKIP_MARGIN", "SKIP_NOTIONAL", "SKIP_LONG_ONLY"):
+                    if buy_id in ("SKIP_MARGIN", "SKIP_NOTIONAL", "SKIP_LONG_ONLY", "SKIP_ENTRIES_PAUSED"):
                         buy_id = None
-                    if sell_id in ("SKIP_MARGIN", "SKIP_NOTIONAL", "SKIP_LONG_ONLY"):
+                    if sell_id in ("SKIP_MARGIN", "SKIP_NOTIONAL", "SKIP_LONG_ONLY", "SKIP_ENTRIES_PAUSED"):
                         sell_id = None
 
                     if not buy_id and not sell_id:
@@ -1317,24 +1325,68 @@ Answer in GERMAN, max 2 sentences:
             except Exception as e:
                 logger.error(f"❌ {symbol} Error: {e}")
     
+    def _entries_paused(self):
+        """Default pausiert. Nur config.ENTRIES_PAUSED = False hebt das auf."""
+        try:
+            import config
+        except Exception:
+            return True
+        return entries_are_paused(config)
+
+    def _notify_entries_paused(self):
+        """Einmal beim Start. Fehlendes Telegram darf den Loop nicht stoppen."""
+        try:
+            import telegram_notify as tg
+            tg.send(
+                "⏸️ <b>V1 SpreadScalper pausiert</b>\n"
+                "Keine neuen Entries. 24-Monats-Backtest netto −302 USDT, "
+                "kein OOS-robuster Edge. Offene Positionen (SL/TP, 24h-Stop, 12h-BE) laufen weiter."
+            )
+        except Exception as e:
+            logger.warning(f"  ⚠️  Telegram zur Entry-Pause nicht gesendet: {e}")
+
+    def _cancel_resting_entries(self):
+        """Limit-Entries vom Markt nehmen. Pos-TPSL offener Positionen bleibt."""
+        for sym in SYMBOLS:
+            try:
+                client._post("/api/v2/mix/order/cancel-all-orders", {
+                    "symbol": sym,
+                    "productType": "USDT-FUTURES",
+                    "marginCoin": "USDT",
+                })
+                logger.info(f"  ⏸️  {sym}: ruhende Entry-Orders gecancelt")
+            except Exception as e:
+                logger.warning(f"  ⏸️  {sym}: Cancel ruhender Entries fehlgeschlagen ({e})")
+        self.pending_orders.clear()
+
     def run(self):
         """Main Loop"""
-        # ── Startup: Hebel setzen + TPSL-Orders aufräumen ──
-        # Hebel für ALLE Symbole setzen (LONG + SHORT), auch wenn Position offen ist
-        for sym in SYMBOLS:
-            for side in ('long', 'short'):
-                try:
-                    client._post("/api/v2/mix/account/set-leverage", {
-                        "symbol": sym, "productType": "USDT-FUTURES",
-                        "marginCoin": "USDT", "leverage": str(LEVERAGE),
-                        "holdSide": side,
-                    })
-                    logger.debug(f"  ⚙️ {sym} {side}: Hebel {LEVERAGE}x gesetzt")
-                except Exception as e:
-                    logger.warning(f"  ⚠️ {sym} {side}: Hebel {LEVERAGE}x fehlgeschlagen ({e})")
-        # _check_existing_tpsl() wurde bereits in __init__ aufgerufen,
-        # aber wir müssen sicherstellen dass bestehende TP/SL NICHT gecancelt werden.
-        # Lösche NUR TPSL-Orders für Symbole OHNE offene Position
+        paused = self._entries_paused()
+        self._pause_log_ts = time.time()
+        if paused:
+            logger.warning(
+                "ENTRIES PAUSIERT — 24-Monats-Backtest netto −302 USDT, "
+                "kein OOS-robuster Edge. Keine neuen Orders. "
+                "Offene Positionen bleiben unter SL/TP, 24h-Stop und 12h-BE. "
+                "Wiederaufnehmen nur mit ENTRIES_PAUSED = False in config.py."
+            )
+            self._notify_entries_paused()
+            self._cancel_resting_entries()
+            logger.info("Hebel-Setup übersprungen (Entries pausiert)")
+        else:
+            # Hebel nur, wenn wirklich neue Orders erlaubt sind.
+            for sym in SYMBOLS:
+                for side in ('long', 'short'):
+                    try:
+                        client._post("/api/v2/mix/account/set-leverage", {
+                            "symbol": sym, "productType": "USDT-FUTURES",
+                            "marginCoin": "USDT", "leverage": str(LEVERAGE),
+                            "holdSide": side,
+                        })
+                        logger.debug(f"  ⚙️ {sym} {side}: Hebel {LEVERAGE}x gesetzt")
+                    except Exception as e:
+                        logger.warning(f"  ⚠️ {sym} {side}: Hebel {LEVERAGE}x fehlgeschlagen ({e})")
+        # Bestehende TP/SL NICHT löschen. Nur verwaiste TPSL ohne Position.
         for sym in SYMBOLS:
             try:
                 pos = client.get_position(sym)
@@ -1355,6 +1407,12 @@ Answer in GERMAN, max 2 sentences:
                 start = time.time()
                 
                 self.run_cycle()
+                if self._entries_paused() and time.time() - self._pause_log_ts >= 3600:
+                    self._pause_log_ts = time.time()
+                    logger.warning(
+                        "ENTRIES PAUSIERT — keine neuen Orders "
+                        "(24-Monats-Backtest ohne OOS-robusten Edge)"
+                    )
                 # Positions-State für Dashboard in JSON schreiben
                 try:
                     state = {}

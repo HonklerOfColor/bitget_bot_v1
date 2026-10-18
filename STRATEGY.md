@@ -1,9 +1,8 @@
 # DS-SpreadScalper — Aktuelle Strategie
 
-> **Gültige Handelsregeln (16.10.2026):** [TRADING_RULES.md](TRADING_RULES.md).
-> Long-only seit 2026-08-26, keine neuen Entries in Europe/Vienna 0–4 / 14 / 17 / 20 / 22,
-> 24h-Time-Stop bei ROE ≤ 0, 12h-Break-Even-SL, Hebel **3×** (nicht 5×).
-> Der Rest dieser Datei ist der Strategie-Stand vom 12.07.2026 und in Richtung, Symbolen und Filtern überholt.
+> **Gültige Handelsregeln (18.10.2026):** [TRADING_RULES.md](TRADING_RULES.md).
+> **Neue Entries pausiert**, solange `config.py` nicht ausdrücklich `ENTRIES_PAUSED = False` setzt.
+> Offene Positionen: SL/TP, 24h-Time-Stop, 12h-Break-Even laufen weiter.
 
 ## Überblick (historisch, 12.07.2026)
 
