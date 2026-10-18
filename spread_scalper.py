@@ -20,7 +20,9 @@ import bitget_client as client
 _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.append(_HERE)
-from trading_rules import entry_hour_blocked, should_arm_breakeven, time_stop_due, vienna_hour
+from trading_rules import (
+    entry_hour_blocked, is_reversal_long, should_arm_breakeven, time_stop_due, vienna_hour,
+)
 
 # ── Config ───────────────────────────────────────────────────────────────────
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "BNBUSDT"]  # SOLUSDT entfernt (Learning: −1.97 USDT über 66 Trades, schwächstes Symbol)
@@ -34,7 +36,7 @@ TELEGRAM_ON = True
 # LONG bei 2 bullish, SHORT bei 2 bearish, sonst kein Trade
 SHORT_ONLY = False
 LONG_ONLY = True         # Learning 26.08.: SHORTs −231 USDT über 1577 Trades → NUR LONG
-EMAFILTER = True        # Trendfilter: True = nur in EMA-Richtung traden (Learning: Shorts ohne Trend verlieren)
+EMAFILTER = True        # Flagge ohne Wirkung im Loop. Zuschalten (EMA20/50) bleibt in der 24-Monats-Studie in 4 von 5 Fenstern negativ, siehe backtest/V1_EDGE_STUDY.md
 
 # 🧠 Trade Analysis — DeepSeek nach jedem Trade
 ANALYSIS_ENABLED = True   # False = deaktivieren (keine API-Kosten)
@@ -563,7 +565,7 @@ Answer in GERMAN, max 2 sentences:
                 c2 = klines[-1]
                 o1 = float(c1[1]); c1_close = float(c1[4])
                 o2 = float(c2[1]); c2_close = float(c2[4])
-                long_signal = c1_close < o1 and c2_close > o2
+                long_signal = is_reversal_long(o1, c1_close, o2, c2_close)
                 if long_signal:
                     logger.debug(f"  📈 Reversal: bear → bull → LONG ({symbol})")
                     return "long"

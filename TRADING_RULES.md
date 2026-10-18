@@ -60,6 +60,10 @@ Im September hat die Fee den Brutto-Edge fast vollständig aufgefressen. Ein Mak
 
 Nicht umgesetzt, weil ein Post-Only-Limit anstelle des Trigger-TP einen Gap durch das Ziel verpassen kann. Sicherer Folge-Schritt, separat zu reviewen: Reduce-Only-Limit auf den TP legen, Trigger-SL behalten, Trigger-TP ein Stück dahinter als Backup stehen lassen. Das ist eine Order-/Exit-Änderung.
 
+## 7. Edge-Studie 2024-10 bis 2026-10 — kein robuster Vorteil
+
+Details: [backtest/V1_EDGE_STUDY.md](backtest/V1_EDGE_STUDY.md). Kurzfassung: die echte Long-Reversal-Logik (Stundensperre, 24h-Stop, 12h-Break-Even, 3×, Maker-Entry 0,02 % + Taker-Exit 0,06 %) hat über 24 Monate nach Kosten einen negativen Erwartungswert. Vier Sechsmonatsfenster bis Juni 2026 sind negativ, das Fenster ab Juli 2026 ist bei der Baseline +0.64 USDT (PF 1.01). EMA, Maker-TP, engerer Time-Stop und Re-Entry-Sperre bleiben in den historischen Fenstern negativ. Deshalb ändert dieser Stand keine Entry-, SL- oder TP-Regel. Empfehlung: V1 nicht weiter mit Größe fahren, bis eine andere These außerhalb dieser Parameter-Nachbarschaft vorliegt.
+
 ## Was bewusst nicht geändert wurde
 
 - Hebel bleibt 3×. Die offenen 3×-Positionen sind kein Verstoß.

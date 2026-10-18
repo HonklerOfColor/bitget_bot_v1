@@ -29,6 +29,19 @@ def entry_hour_blocked(epoch_s=None):
     return vienna_hour(epoch_s) in BLOCKED_ENTRY_HOURS
 
 
+def is_bearish(open_, close):
+    return close < open_
+
+
+def is_bullish(open_, close):
+    return close > open_
+
+
+def is_reversal_long(prev_open, prev_close, cur_open, cur_close):
+    """Vorherige Kerze rot, aktuelle grün. Live nutzt die noch offene Kerze."""
+    return is_bearish(prev_open, prev_close) and is_bullish(cur_open, cur_close)
+
+
 def unrealized_roe_pct(pnl, size, mark, leverage):
     """ROE in Prozent. None, wenn sich die Position nicht bewerten lässt."""
     if size <= 0 or mark <= 0 or leverage <= 0:
