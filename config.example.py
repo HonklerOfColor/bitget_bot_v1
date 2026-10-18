@@ -31,6 +31,9 @@ LOOP_INTERVAL = 30
 DRY_RUN       = False
 LOG_LEVEL     = "INFO"
 DEMO_MODE     = True   # paptrading: 1 header for Bitget demo account
+# Neue Entries bleiben aus, solange das nicht ausdrücklich False ist.
+# Fehlt die Zeile in config.py, behandelt der Bot sie als pausiert.
+ENTRIES_PAUSED = True
 
 # Remaining constants from config.py — only needed for other strategies
 HURST_WINDOW = 300
