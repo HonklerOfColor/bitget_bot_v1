@@ -7,7 +7,10 @@ sys.path.insert(0, "/Users/andreas/bitget_bot_v1")
 import bitget_client as client
 
 REFRESH = 3
-LEVERAGE = 5
+# Fallback nur wenn die Position weder marginSize noch leverage liefert.
+# Der Live-Bot setzt 3× (spread_scalper.LEVERAGE). Nicht 5× annehmen —
+# das hat die angezeigte ROE gegenüber der Exchange verfälscht.
+FALLBACK_LEVERAGE = 3
 STATE_PATH = "/Users/andreas/bitget_bot_v1/bot_state.json"
 
 def read_bot_state():
@@ -74,15 +77,28 @@ def main():
                 sl    = bdata.get('sl') or p.get('stopLoss')
                 tp    = bdata.get('tp') or p.get('takeProfit')
                 liq   = float(p.get('liquidationPrice', 0))
-                margin = size * mark / LEVERAGE
+                try:
+                    lev = float(p.get('leverage') or 0)
+                except (TypeError, ValueError):
+                    lev = 0.0
+                try:
+                    margin_ex = float(p.get('marginSize') or 0)
+                except (TypeError, ValueError):
+                    margin_ex = 0.0
+                if margin_ex > 0:
+                    margin = margin_ex
+                else:
+                    use_lev = lev if lev > 0 else FALLBACK_LEVERAGE
+                    margin = size * mark / use_lev if use_lev > 0 else 0
                 roe   = pnl / margin * 100 if margin > 0 else 0
+                lev_txt = f"{lev:.0f}×" if lev > 0 else f"{FALLBACK_LEVERAGE:.0f}×?"
                 
                 prot = (side=='long' and sl and float(sl) < mark) or \
                        (side=='short' and sl and float(sl) > mark)
                 icon = "\033[32m🔒\033[0m" if prot else "\033[33m🔓\033[0m"
                 
                 safe_text = " \033[32m✅ Trade SL abgesichert!\033[0m" if prot and roe > 1 else ""
-                print(f"\n  \033[1m{sym:9s}\033[0m {side.upper():6s} {icon}{safe_text}")
+                print(f"\n  \033[1m{sym:9s}\033[0m {side.upper():6s} {lev_txt} {icon}{safe_text}")
                 print(f"  Entry: \033[36m{entry:>10.2f}\033[0m  Mark: \033[36m{mark:>10.2f}\033[0m  ROE: {roe_c(roe)}")
                 print(f"  Size:  {size:>8.4f}    Margin: {margin:>8.2f}   Liq: {liq:>10.2f}")
                 print(f"  PnL:   {pnl_c(pnl)} USDT")
